@@ -7,7 +7,6 @@ import tempfile
 from pathlib import Path
 
 _TIME_RE = re.compile(r"^(?:(\d+):)?(\d{1,2}):(\d{1,2}(?:\.\d+)?)$")
-_FADE_DUR = 0.35  # seconds for fade-in / fade-out at clip boundaries
 
 
 def parse_timestamp(ts: str) -> float:
@@ -41,13 +40,8 @@ def parse_ranges(ranges_str: str) -> list[tuple[float, float]]:
 
 
 def cut_and_concat(video_path: Path, ranges: list[tuple[float, float]], output_path: Path) -> Path:
-    """Cut each (start, end) range from video_path and concatenate them in order into output_path.
-
-    When multiple ranges are given, each clip fades out to black and the next fades in,
-    producing a smooth cross-cut transition.
-    """
+    """Cut each (start, end) range from video_path and concatenate them in order into output_path."""
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    n = len(ranges)
 
     with tempfile.TemporaryDirectory(prefix="movie-shorts-") as tmp:
         tmp_dir = Path(tmp)
@@ -55,36 +49,23 @@ def cut_and_concat(video_path: Path, ranges: list[tuple[float, float]], output_p
 
         for i, (start, end) in enumerate(ranges):
             segment_path = tmp_dir / f"segment_{i:02d}.mp4"
-            duration = end - start
-
-            # Build fade filters when joining multiple clips
-            vf_parts: list[str] = []
-            af_parts: list[str] = []
-            if n > 1 and duration > _FADE_DUR * 2 + 0.1:
-                if i > 0:
-                    vf_parts.append(f"fade=t=in:st=0:d={_FADE_DUR}")
-                    af_parts.append(f"afade=t=in:st=0:d={_FADE_DUR}")
-                if i < n - 1:
-                    vf_parts.append(f"fade=t=out:st={duration - _FADE_DUR}:d={_FADE_DUR}")
-                    af_parts.append(f"afade=t=out:st={duration - _FADE_DUR}:d={_FADE_DUR}")
-
-            cmd = [
-                "ffmpeg", "-y",
-                "-ss", str(start),
-                "-i", str(video_path),
-                "-t", str(duration),
-            ]
-            if vf_parts:
-                cmd += ["-vf", ",".join(vf_parts)]
-            if af_parts:
-                cmd += ["-af", ",".join(af_parts)]
-            cmd += [
-                "-c:v", "libx264", "-c:a", "aac",
-                "-avoid_negative_ts", "make_zero",
-                str(segment_path),
-            ]
-
-            subprocess.run(cmd, check=True, capture_output=True)
+            try:
+                subprocess.run(
+                    [
+                        "ffmpeg", "-y",
+                        "-ss", str(start),
+                        "-i", str(video_path),
+                        "-t", str(end - start),
+                        "-c:v", "libx264", "-c:a", "aac",
+                        "-avoid_negative_ts", "make_zero",
+                        str(segment_path),
+                    ],
+                    check=True,
+                    capture_output=True,
+                )
+            except subprocess.CalledProcessError as e:
+                stderr = e.stderr.decode(errors="replace") if e.stderr else ""
+                raise RuntimeError(f"ffmpeg segment {i} failed:\n{stderr}") from None
             segment_paths.append(segment_path)
 
         if len(segment_paths) == 1:
@@ -96,16 +77,20 @@ def cut_and_concat(video_path: Path, ranges: list[tuple[float, float]], output_p
             "\n".join(f"file '{p.as_posix()}'" for p in segment_paths),
             encoding="utf-8",
         )
-        subprocess.run(
-            [
-                "ffmpeg", "-y",
-                "-f", "concat", "-safe", "0",
-                "-i", str(concat_list),
-                "-c:v", "libx264", "-c:a", "aac",
-                str(output_path),
-            ],
-            check=True,
-            capture_output=True,
-        )
+        try:
+            subprocess.run(
+                [
+                    "ffmpeg", "-y",
+                    "-f", "concat", "-safe", "0",
+                    "-i", str(concat_list),
+                    "-c:v", "libx264", "-c:a", "aac",
+                    str(output_path),
+                ],
+                check=True,
+                capture_output=True,
+            )
+        except subprocess.CalledProcessError as e:
+            stderr = e.stderr.decode(errors="replace") if e.stderr else ""
+            raise RuntimeError(f"ffmpeg concat failed:\n{stderr}") from None
 
     return output_path

@@ -8,7 +8,7 @@ _AUDIO_EXTS = {".mp3", ".wav", ".ogg", ".aac", ".flac", ".m4a"}
 
 # Available watermarks — add more entries here to extend the selectable list later.
 WATERMARKS: dict[str, str] = {
-    "mv-edits": "MV Edits",
+    "mv-edits": "MV EDITS",
 }
 
 
@@ -19,18 +19,17 @@ def _escape_filter_path(path: Path) -> str:
     return p
 
 
-def _watermark_filter(text: str, fade_start: float = 2.5, fade_end: float = 3.0) -> str:
-    """Build a drawtext filter fragment: bottom-centre text that fades out between fade_start and fade_end."""
-    span = fade_end - fade_start
-    alpha_expr = f"if(lt(t,{fade_start}),1.0,if(lt(t,{fade_end}),({fade_end}-t)/{span},0))"
+def _watermark_filter(text: str, visible_until: float = 3.0) -> str:
+    """Build a drawtext filter: bottom-centre, 50% translucent white, disappears at visible_until seconds."""
     safe_text = text.replace("'", "\\'").replace(":", "\\:")
     return (
         f"drawtext=text='{safe_text}'"
         f":fontsize=28"
         f":fontcolor=white"
-        f":alpha='{alpha_expr}'"
+        f":alpha=0.5"
         f":x=(w-tw)/2"
         f":y=h-th-40"
+        f":enable='between(t,0,{visible_until})'"
     )
 
 
@@ -56,16 +55,17 @@ def burn_subtitles(
     vf = f"ass='{ass_arg}'"
     if watermark:
         vf += f",{_watermark_filter(watermark)}"
+    print(f"      [vf] {vf}")
 
-    if bg_music:
-        dur = _get_duration(video_path)
-        filter_complex = (
-            f"[1:a]aloop=loop=-1:size=2000000000,atrim=0:{dur},"
-            f"volume={bg_volume}[bg];"
-            f"[0:a][bg]amix=inputs=2:duration=first:dropout_transition=2[aout]"
-        )
-        subprocess.run(
-            [
+    try:
+        if bg_music:
+            dur = _get_duration(video_path)
+            filter_complex = (
+                f"[1:a]aloop=loop=-1:size=2000000000,atrim=0:{dur},"
+                f"volume={bg_volume}[bg];"
+                f"[0:a][bg]amix=inputs=2:duration=first:dropout_transition=2[aout]"
+            )
+            _run_ffmpeg([
                 "ffmpeg", "-y",
                 "-i", str(video_path),
                 "-i", str(bg_music),
@@ -74,23 +74,23 @@ def burn_subtitles(
                 "-map", "0:v", "-map", "[aout]",
                 "-c:v", "libx264", "-c:a", "aac",
                 str(output_path),
-            ],
-            check=True,
-            capture_output=True,
-        )
-    else:
-        subprocess.run(
-            [
+            ])
+        else:
+            _run_ffmpeg([
                 "ffmpeg", "-y",
                 "-i", str(video_path),
                 "-vf", vf,
                 "-c:v", "libx264", "-c:a", "copy",
                 str(output_path),
-            ],
-            check=True,
-            capture_output=True,
-        )
+            ])
+    except subprocess.CalledProcessError as e:
+        stderr = e.stderr.decode(errors="replace") if e.stderr else ""
+        raise RuntimeError(f"ffmpeg failed (exit {e.returncode}):\n{stderr}") from None
     return output_path
+
+
+def _run_ffmpeg(cmd: list) -> None:
+    subprocess.run(cmd, check=True, capture_output=True)
 
 
 def _get_duration(video_path: Path) -> float:
