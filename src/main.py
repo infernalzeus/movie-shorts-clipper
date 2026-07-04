@@ -71,7 +71,8 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Build a captioned movie short with AI metadata.")
     parser.add_argument("--video", help="Path to the source movie file (skips the prompt)")
     parser.add_argument("--ranges", help="Timestamp ranges, e.g. '3:20-3:30; 5:15-5:45' (skips the prompt)")
-    parser.add_argument("--whisper-model", default="small", help="faster-whisper model size (default: small)")
+    parser.add_argument("--whisper-model", default="medium", help="faster-whisper model size (default: medium)")
+    parser.add_argument("--language", default="en", help="Transcription language code (default: en)")
     parser.add_argument("--ollama-model", default=DEFAULT_MODEL, help=f"Ollama model for metadata (default: {DEFAULT_MODEL})")
     parser.add_argument("--source-title", help="Movie/show name override (default: parsed from the filename)")
     parser.add_argument("--size", type=int, default=1080, help="Output square side length in pixels (default: 1080)")
@@ -121,7 +122,7 @@ def main() -> None:
     print(f"      -> {square_clip_path}")
 
     print("[3/6] Transcribing clip with faster-whisper...")
-    words = transcribe(square_clip_path, model_size=args.whisper_model)
+    words = transcribe(square_clip_path, model_size=args.whisper_model, language=args.language, source_title=source_title)
     transcript = words_to_text(words)
     print(f"      -> {len(words)} words transcribed")
 

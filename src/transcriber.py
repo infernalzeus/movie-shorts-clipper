@@ -18,10 +18,25 @@ def transcribe(
     model_size: str = "small",
     device: str = "auto",
     compute_type: str = "auto",
+    language: str = "en",
+    source_title: str = "",
 ) -> list[Word]:
     """Run faster-whisper on video_path and return a flat list of word-level timestamps."""
     model = WhisperModel(model_size, device=device, compute_type=compute_type)
-    segments, _info = model.transcribe(str(video_path), word_timestamps=True)
+
+    # Seed Whisper with movie context so proper nouns and dialogue style bias its vocabulary
+    initial_prompt = f"Transcript of dialogue from the movie or show '{source_title}'." if source_title else None
+
+    segments, _info = model.transcribe(
+        str(video_path),
+        word_timestamps=True,
+        language=language,
+        task="transcribe",
+        beam_size=5,
+        best_of=5,
+        temperature=[0.0, 0.2, 0.4],  # retry with higher randomness on low-confidence segments
+        initial_prompt=initial_prompt,
+    )
 
     words = []
     for segment in segments:
@@ -31,4 +46,6 @@ def transcribe(
 
 
 def words_to_text(words: list[Word]) -> str:
-    return " ".join(w.text for w in words)
+    # Import here to avoid circular dependency (captions imports transcriber)
+    from captions import _censor_word
+    return " ".join(_censor_word(w.text) for w in words)

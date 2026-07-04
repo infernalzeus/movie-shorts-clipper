@@ -4,9 +4,46 @@
   sentence fades in and fades out smoothly.
 """
 
+import re
 from pathlib import Path
 
 from transcriber import Word
+
+# ── Profanity censorship ─────────────────────────────────────────────────────
+# Maps the lowercase word (no punctuation) → censored display form.
+# Keeps first and last letter, asterisks in the middle, preserves surrounding punctuation.
+
+_PROFANITY = {
+    "shit", "shits", "shitting", "shitted",
+    "fuck", "fucks", "fucking", "fucked", "fucker", "fuckers", "motherfucker", "motherfuckers",
+    "bitch", "bitches", "bitching",
+    "ass", "asses", "asshole", "assholes",
+    "bastard", "bastards",
+    "cunt", "cunts",
+    "damn", "damned", "goddamn", "goddamned",
+    "hell",  # optional — comment out if too aggressive
+    "piss", "pissed", "pissing",
+    "cock", "cocks", "dick", "dicks",
+    "whore", "whores",
+    "crap", "craps",
+}
+
+
+def _censor_word(token: str) -> str:
+    """Return censored form of token if it contains profanity, preserving surrounding punctuation."""
+    # split leading/trailing punctuation from the core word
+    m = re.fullmatch(r"([^a-zA-Z]*)([a-zA-Z]+)([^a-zA-Z]*)", token)
+    if not m:
+        return token
+    pre, word, post = m.group(1), m.group(2), m.group(3)
+    if word.lower() not in _PROFANITY:
+        return token
+    if len(word) <= 2:
+        return pre + word[0] + "*" + post
+    stars = "*" * (len(word) - 2)
+    censored = word[0] + stars + word[-1]
+    # preserve original casing of first/last letter
+    return pre + censored + post
 
 # ── Layer ordering (higher = drawn on top) ──────────────────────────────────
 _LAYER_TITLE_BG   = 0   # white rect drawing
@@ -16,8 +53,17 @@ _LAYER_CAPTION    = 2   # sentence captions
 # ── Colours (ASS ABGR hex: &HAABBGGRR) ──────────────────────────────────────
 _WHITE       = "&H00FFFFFF"
 _BLACK       = "&H00000000"
-_GRAY_DIM    = "&HC0808080"  # 75% opaque gray  → unspoken words
-_BOX_BG      = "&H99000000"  # ~60% opaque black → caption background box
+_INVISIBLE   = "&HFF000000"  # fully transparent → unspoken words stay hidden
+
+# TikTok-style caption palette (ASS is &H00BBGGRR — no alpha, opaque). Cycled per sentence.
+_CAPTION_PALETTE = [
+    "&H00FFFFFF",  # white
+    "&H0000FFFF",  # yellow
+    "&H0000FF00",  # green (lime)
+    "&H00FFFF00",  # cyan
+    "&H00FF66FF",  # pink/magenta
+    "&H0000A5FF",  # orange
+]
 
 _HEADER = """\
 [Script Info]
@@ -31,7 +77,7 @@ ScaledBorderAndShadow: yes
 Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
 Style: TitleBg,Arial,20,{white},{white},{white},{white},0,0,0,0,100,100,0,0,1,0,0,7,0,0,0,1
 Style: TitleText,Arial Black,{title_fontsize},{black},{black},{white},{black},-1,0,0,0,100,100,0,0,1,0,0,5,40,40,40,1
-Style: Caption,Arial Black,{caption_fontsize},{white},{gray_dim},{black},{box_bg},-1,0,0,0,100,100,0,0,3,0,0,2,60,60,{caption_margin_v},1
+Style: Caption,Arial Black,{caption_fontsize},{white},{invisible},{black},{black},-1,0,0,0,100,100,0,0,1,4,0,2,60,60,{caption_margin_v},1
 
 [Events]
 Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
@@ -84,8 +130,13 @@ def _title_card_lines(
 
 # ── Sentence grouping ────────────────────────────────────────────────────────
 
-def _group_sentences(words: list[Word], pause_threshold: float = 0.65) -> list[list[Word]]:
-    """Split a flat word list into sentences by punctuation or long inter-word pauses."""
+_MAX_WORDS_PER_LINE = 7  # force a break even mid-sentence so captions don't sprawl across the screen
+
+
+def _group_sentences(
+    words: list[Word], pause_threshold: float = 0.65, max_words: int = _MAX_WORDS_PER_LINE,
+) -> list[list[Word]]:
+    """Split a flat word list into short caption chunks by punctuation, long pauses, or a word-count cap."""
     sentences: list[list[Word]] = []
     current: list[Word] = []
 
@@ -97,8 +148,9 @@ def _group_sentences(words: list[Word], pause_threshold: float = 0.65) -> list[l
         ends_sentence = bool(stripped) and stripped[-1] in ".?!"
         is_last       = (i == len(words) - 1)
         long_pause    = (not is_last) and (words[i + 1].start - word.end > pause_threshold)
+        too_long      = len(current) >= max_words
 
-        if ends_sentence or long_pause or is_last:
+        if ends_sentence or long_pause or too_long or is_last:
             if current:
                 sentences.append(current)
             current = []
@@ -108,8 +160,12 @@ def _group_sentences(words: list[Word], pause_threshold: float = 0.65) -> list[l
 
 # ── Caption event builder ────────────────────────────────────────────────────
 
-def _sentence_line(sentence_words: list[Word], fade_out_ms: int = 400) -> str:
-    """One ASS Dialogue line for an entire sentence with per-word karaoke timing."""
+def _sentence_line(sentence_words: list[Word], color: str, fade_out_ms: int = 400) -> str:
+    """One ASS Dialogue line for an entire sentence with per-word karaoke timing.
+
+    color overrides PrimaryColour for this line (TikTok-style per-sentence color).
+    A glow effect comes from \\blur softening the (already-set) style outline.
+    """
     evt_start = sentence_words[0].start
     evt_end   = sentence_words[-1].end + fade_out_ms / 1000
 
@@ -122,11 +178,11 @@ def _sentence_line(sentence_words: list[Word], fade_out_ms: int = 400) -> str:
             dur_s = word.end - word.start
         dur_cs = max(1, round(dur_s * 100))
 
-        text = word.text.strip().upper().replace("\\", "").replace("{", "").replace("}", "")
+        text = _censor_word(word.text.strip()).upper().replace("\\", "").replace("{", "").replace("}", "")
         parts.append(f"{{\\k{dur_cs}}}{text}")
 
-    # \fad(in_ms, out_ms)  \an2 = bottom-centre (handled by style MarginV)
-    body = "{\\fad(250," + str(fade_out_ms) + ")}" + " ".join(parts)
+    # \fad = fade in/out, \c = per-line text color, \blur = soft glow on the outline
+    body = "{\\fad(250," + str(fade_out_ms) + f")\\c{color}\\blur2" + "}" + " ".join(parts)
     return (
         f"Dialogue: {_LAYER_CAPTION},"
         f"{_fmt_time(evt_start)},{_fmt_time(evt_end)},"
@@ -164,8 +220,7 @@ def build_ass(
             height=video_height,
             white=_WHITE,
             black=_BLACK,
-            gray_dim=_GRAY_DIM,
-            box_bg=_BOX_BG,
+            invisible=_INVISIBLE,
             title_fontsize=title_fontsize,
             caption_fontsize=caption_fontsize,
             caption_margin_v=caption_margin_v,
@@ -175,8 +230,9 @@ def build_ass(
     if title:
         lines.extend(_title_card_lines(title, video_width, panel_h))
 
-    for sentence_words in _group_sentences(words):
-        lines.append(_sentence_line(sentence_words))
+    for i, sentence_words in enumerate(_group_sentences(words)):
+        color = _CAPTION_PALETTE[i % len(_CAPTION_PALETTE)]
+        lines.append(_sentence_line(sentence_words, color))
 
     output_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
     return output_path

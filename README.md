@@ -1,38 +1,14 @@
 # movie-shorts-clipper
 
-Turn a movie file into a captioned YouTube Short: pick one or more timestamp ranges,
-cut/concat them, crop to vertical 9:16, transcribe with local Whisper, burn in
-glowy gold word-pop captions plus a sliding title card, and generate a
-title/description/tags with a local Ollama model.
+Turn any movie or TV file into a upload-ready YouTube Short. Give it a file and one or more timestamp ranges — it cuts the clip, crops to 9:16, transcribes with local Whisper, burns in animated word-pop captions, and generates a YouTube title/description/tags via a local Ollama model.
 
-## Pipeline
+## What you need installed first
 
-1. **Cut & concat** — `src/clip_selector.py` cuts the timestamp range(s) you give it
-   out of the source movie and concatenates them into one clip (ffmpeg).
-2. **Crop to vertical** — `src/reformat.py` center-crops the clip to 9:16 (default
-   1080x1920) and scales it, since source movies are widescreen.
-3. **Transcribe** — `src/transcriber.py` runs local `faster-whisper` on the cropped
-   clip to get word-level timestamps.
-4. **Metadata** — `src/metadata.py` sends the transcript, plus the movie/show name
-   parsed from the source filename, to a local Ollama model and gets back a JSON
-   title/description/tags for the Short (title is short — it doubles as the
-   on-screen title card text).
-5. **Captions** — `src/captions.py` builds an `.ass` subtitle file:
-   - One bold gold word at a time pops in sync with speech, with a blurred
-     glow/shine halo (two-layer ASS style: blurred glow + crisp text).
-   - A white-box, black-text, all-caps title card slides in at the very top,
-     holds for ~1.5s, then slides up off-screen by ~2s in.
-6. **Burn-in** — `src/burn.py` burns the `.ass` captions into the video with
-   ffmpeg's `libass`-backed `ass` filter.
-
-## Requirements
-
-- `ffmpeg` and `ffprobe` on PATH (with `libass` support — check via `ffmpeg -filters | grep ass`).
-- A running local Ollama server (`http://localhost:11434`) with a model pulled.
-  Default model is `nemotron-3-super:cloud`. Reasoning models are fine here (unlike
-  some others, e.g. `qwen3.6`, which puts output in a `thinking` field instead of
-  `response` under `format=json` and returns empty metadata — avoid those).
-- Python deps: `pip install -r requirements.txt`
+- **ffmpeg** on PATH, compiled with `libass` — verify with `ffmpeg -filters | grep ass`
+- **Ollama** running at `http://localhost:11434` with a model pulled. Default: `nemotron-3-super:cloud`.
+  - Avoid reasoning models like `qwen3.6` — they return output in a `thinking` field under `format=json`, which breaks metadata parsing.
+- **Python 3.11+** and dependencies: `pip install -r requirements.txt`
+- **faster-whisper** will download the Whisper model on first run (~1.5 GB for `medium`). No manual setup needed.
 
 ## Usage
 
@@ -41,39 +17,62 @@ cd src
 python main.py
 ```
 
-It will prompt for:
-- the movie file path
-- one or more clip ranges, e.g. `3:20-3:30; 5:15-5:45` (semicolon or comma separated)
-
-Or skip the prompts with flags:
+Prompts for the movie file path and clip range(s). Or skip the prompts:
 
 ```
-python main.py --video "C:\movies\The.Last.Heist.2019.1080p.BluRay.x264-GROUP.mkv" \
-  --ranges "3:20-3:30; 5:15-5:45" \
-  --whisper-model small --ollama-model nemotron-3-super:cloud \
-  --crop-w 1080 --crop-h 1920
+python main.py \
+  --video "C:\movies\The.Last.Heist.2019.1080p.BluRay.x264.mkv" \
+  --ranges "3:20-3:30; 5:15-5:45"
 ```
 
-The movie/show name used for metadata is parsed automatically from the filename
-(strips brackets, resolution/codec/release tags, years, release-group suffixes).
-Override it with `--source-title "The Last Heist"` if the auto-parse looks off.
+Multiple ranges are concatenated into a single clip. Ranges are semicolon or comma separated.
+
+## All flags
+
+| Flag | Default | What it does |
+|------|---------|--------------|
+| `--video` | (prompt) | Path to source movie file |
+| `--ranges` | (prompt) | Clip ranges, e.g. `3:20-3:30; 5:15-5:45` |
+| `--source-title` | parsed from filename | Movie/show name for metadata — override if auto-parse looks off |
+| `--whisper-model` | `medium` | Whisper model size: `tiny`, `base`, `small`, `medium`, `large-v3` |
+| `--ollama-model` | `nemotron-3-super:cloud` | Ollama model for title/description/tags |
+| `--crop-w` / `--crop-h` | `1080` / `1920` | Output resolution (default 9:16 vertical) |
+| `--bg-music` | random from `audio/` | Path to a background music file |
+| `--bg-volume` | `0.10` | Background music volume (0.0–1.0) |
+| `--no-bg-music` | — | Disable background music entirely |
+| `--language` | `en` | Whisper transcription language |
+
+## Pipeline
+
+1. **Cut & concat** — slices the timestamp ranges out of the source and concatenates them (ffmpeg).
+2. **Crop to vertical** — center-crops to 9:16 with a blurred background fill for the pillarbox areas.
+3. **Transcribe** — runs `faster-whisper` locally with `beam_size=5` and accent-retry temperatures. Seeded with the movie title to bias vocabulary toward proper nouns. Default model: `medium`.
+4. **Metadata** — fetches a Wikipedia summary of the movie/show for context, then asks Ollama to write a title (≤40 chars, used as the on-screen title card), a description (opens with movie background, ends with hashtags), and 10–15 keyword tags. Hashtags are also guaranteed-appended programmatically so the LLM can't skip them.
+5. **Captions** — builds an `.ass` subtitle file:
+   - Words light up one at a time in sync with speech (karaoke-style), cycling through a TikTok-style color palette per sentence.
+   - Profanity is auto-censored (`shit` → `SH*T`, `fucking` → `F****G`, etc.) — edit the `_PROFANITY` set in `src/captions.py` to add/remove words.
+   - A white-panel title card slides in at the top, holds ~1.5s, then slides off.
+6. **Burn-in** — ffmpeg bakes the captions into the final video. Optional background music is mixed in at low volume.
 
 ## Output
 
-Everything lands in `output/<movie-name-slug>/`:
+Everything lands in `output/<movie-slug>/`:
 
-- `clip_raw.mp4` — cut/concatenated clip, no crop/captions
-- `clip_vertical.mp4` — cropped to 9:16
-- `captions.ass` — generated subtitle file (word-pop + title card)
-- `clip_final.mp4` — final captioned vertical video
-- `metadata.json` — `{title, description, tags}`
-- `description.txt` — ready-to-paste YouTube description with hashtags
+| File | Contents |
+|------|----------|
+| `clip_raw.mp4` | Cut/concatenated clip, widescreen, no captions |
+| `clip_square.mp4` | Cropped to 9:16 with blurred background |
+| `captions.ass` | Generated subtitle file |
+| `clip_final.mp4` | Final captioned vertical video — upload this |
+| `metadata.json` | `{ title, description, tags }` |
+| `description.txt` | Ready-to-paste YouTube description with hashtags |
+
+## Background music
+
+Drop `.mp3` / `.wav` / `.ogg` files into the `audio/` folder. One is picked at random each run. Use `--bg-music` to pin a specific file, or `--no-bg-music` to skip.
 
 ## Notes
 
-- `--whisper-model` accepts any faster-whisper size (`tiny`, `base`, `small`,
-  `medium`, `large-v3`, ...). Larger models are slower but more accurate.
-- The vertical crop is a simple center crop — no subject tracking/face detection.
-  For off-center subjects, pre-crop the source or adjust `--crop-w`/`--crop-h`.
-- The Ollama title is capped at ~40 characters by the prompt so it fits the
-  on-screen title card; it's reused as-is for the YouTube title.
+- The vertical crop is a simple center crop — no face tracking. For off-center subjects, pre-crop the source or adjust `--crop-w`/`--crop-h`.
+- Wikipedia context lookup is best-effort — if the title isn't found, the LLM falls back to its own knowledge.
+- For the best transcription accuracy on heavy accents or non-English dialogue, use `--whisper-model large-v3`.
