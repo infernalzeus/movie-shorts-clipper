@@ -4,6 +4,21 @@ import subprocess
 from pathlib import Path
 
 
+def get_duration(video_path: Path) -> float:
+    result = subprocess.run(
+        [
+            "ffprobe", "-v", "error",
+            "-show_entries", "format=duration",
+            "-of", "default=noprint_wrappers=1:nokey=1",
+            str(video_path),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    return float(result.stdout.strip())
+
+
 def get_resolution(video_path: Path) -> tuple[int, int]:
     result = subprocess.run(
         [

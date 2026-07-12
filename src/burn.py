@@ -48,7 +48,12 @@ def burn_subtitles(
     bg_music: Path | None = None,
     bg_volume: float = 0.10,
     watermark: str | None = None,
+    narration_audio: Path | None = None,
+    narration_volume: float = 0.05,
 ) -> Path:
+    """Burn the .ass captions into the video and mix the audio layers:
+    movie audio (full, unchanged) + narration voiceover at narration_volume,
+    laid on top + optional looped bg music."""
     output_path.parent.mkdir(parents=True, exist_ok=True)
     ass_arg = _escape_filter_path(ass_path)
 
@@ -58,7 +63,42 @@ def burn_subtitles(
     print(f"      [vf] {vf}")
 
     try:
-        if bg_music:
+        if narration_audio:
+            dur = _get_duration(video_path)
+            inputs = ["-i", str(video_path), "-i", str(narration_audio)]
+            # Movie audio plays at full volume, untouched — the narration is just
+            # laid quietly on top (the text band carries the meaning, so the voice
+            # doesn't need to duck the film). No ducking = no muted tail.
+            # amix with normalize=0 sums inputs rather than averaging them, so the
+            # movie keeps its level. narration.wav is already exactly the clip
+            # length (tts.py pads it), so no apad is needed — and an *unbounded*
+            # apad here would deadlock amix. bg music is looped then hard-trimmed
+            # to the clip length for the same reason.
+            chains = [f"[1:a]volume={narration_volume}[nar]"]
+            mix_labels = "[0:a][nar]"
+            n_mix = 2
+            if bg_music:
+                inputs += ["-i", str(bg_music)]
+                chains.append(
+                    f"[2:a]aloop=loop=-1:size=2000000000,atrim=0:{dur},volume={bg_volume}[bg]"
+                )
+                mix_labels += "[bg]"
+                n_mix = 3
+            # duration=first → the movie ([0:a]) sets the length, so its tail is
+            # never clipped; amix pads the finite narration with trailing silence.
+            chains.append(
+                f"{mix_labels}amix=inputs={n_mix}:duration=first:normalize=0[aout]"
+            )
+            _run_ffmpeg([
+                "ffmpeg", "-y",
+                *inputs,
+                "-filter_complex", ";".join(chains),
+                "-vf", vf,
+                "-map", "0:v", "-map", "[aout]",
+                "-c:v", "libx264", "-c:a", "aac",
+                str(output_path),
+            ])
+        elif bg_music:
             dur = _get_duration(video_path)
             filter_complex = (
                 f"[1:a]aloop=loop=-1:size=2000000000,atrim=0:{dur},"

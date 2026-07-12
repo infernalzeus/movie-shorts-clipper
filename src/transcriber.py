@@ -3,8 +3,6 @@
 from dataclasses import dataclass
 from pathlib import Path
 
-from faster_whisper import WhisperModel
-
 
 @dataclass
 class Word:
@@ -22,6 +20,9 @@ def transcribe(
     source_title: str = "",
 ) -> list[Word]:
     """Run faster-whisper on video_path and return a flat list of word-level timestamps."""
+    # Imported lazily so SRT-based runs never pay the faster-whisper/ctranslate2 load cost
+    from faster_whisper import WhisperModel
+
     model = WhisperModel(model_size, device=device, compute_type=compute_type)
 
     # Seed Whisper with movie context so proper nouns and dialogue style bias its vocabulary

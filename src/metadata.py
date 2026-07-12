@@ -1,10 +1,16 @@
 """Generate a YouTube Shorts title, description, and tags from a clip transcript via local Ollama."""
 
 import json
+import os
 
 import requests
 
 OLLAMA_URL = "http://localhost:11434/api/generate"
+# The only non-localhost call the pipeline makes on its own is this Wikipedia
+# lookup (edge-tts in tts.py is the other). Set CLIPPER_NO_WEB_CONTEXT=1 to skip
+# it entirely and stay fully offline apart from Ollama — the LLM then leans on
+# its own knowledge of the film for the description.
+_SKIP_WEB_CONTEXT = os.getenv("CLIPPER_NO_WEB_CONTEXT", "").strip() not in ("", "0", "false", "False")
 DEFAULT_MODEL = "nemotron-3-super:cloud"
 FALLBACK_MODEL = "gemma4:e2b"
 
@@ -38,12 +44,19 @@ Respond with ONLY a JSON object, no other text, in this exact shape:
 
 
 def fetch_movie_context(source_title: str) -> str:
-    """Fetch a brief Wikipedia summary for the movie/show to ground the description."""
+    """Fetch a brief Wikipedia summary for the movie/show to ground the description.
+
+    Best-effort and fail-fast: a short timeout means a blocked or slow route
+    (e.g. traffic funnelled through a VPN/exit node) degrades gracefully to no
+    context rather than stalling the pipeline. Disable with CLIPPER_NO_WEB_CONTEXT=1.
+    """
+    if _SKIP_WEB_CONTEXT:
+        return ""
     try:
         encoded = requests.utils.quote(source_title)
         resp = requests.get(
             f"https://en.wikipedia.org/api/rest_v1/page/summary/{encoded}",
-            timeout=10,
+            timeout=4,
             headers={"User-Agent": "movie-shorts-clipper/1.0"},
         )
         if resp.status_code == 200:

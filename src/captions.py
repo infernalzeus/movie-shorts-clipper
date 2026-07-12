@@ -2,6 +2,8 @@
 - Title card: white full-width panel at the top that slides off after ~2 s.
 - Captions: sentence-by-sentence, each word lights up (karaoke) as it is spoken,
   sentence fades in and fades out smoothly.
+- Narration (optional): TTS voiceover text shown in the band beneath the video
+  on the vertical layout, one sentence at a time in sync with the voice.
 """
 
 import re
@@ -49,6 +51,7 @@ def _censor_word(token: str) -> str:
 _LAYER_TITLE_BG   = 0   # white rect drawing
 _LAYER_TITLE_TEXT = 1   # black title text
 _LAYER_CAPTION    = 2   # sentence captions
+_LAYER_NARRATION  = 3   # narration text band
 
 # ── Colours (ASS ABGR hex: &HAABBGGRR) ──────────────────────────────────────
 _WHITE       = "&H00FFFFFF"
@@ -78,6 +81,7 @@ Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour,
 Style: TitleBg,Arial,20,{white},{white},{white},{white},0,0,0,0,100,100,0,0,1,0,0,7,0,0,0,1
 Style: TitleText,Arial Black,{title_fontsize},{black},{black},{white},{black},-1,0,0,0,100,100,0,0,1,0,0,5,40,40,40,1
 Style: Caption,Arial Black,{caption_fontsize},{white},{invisible},{black},{black},-1,0,0,0,100,100,0,0,1,4,0,2,60,60,{caption_margin_v},1
+Style: Narration,Arial,{narration_fontsize},{narration_color},{narration_color},{black},{black},0,0,0,0,100,100,0,0,1,1,0,8,70,70,{narration_margin_v},1
 
 [Events]
 Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
@@ -190,6 +194,25 @@ def _sentence_line(sentence_words: list[Word], color: str, fade_out_ms: int = 40
     )
 
 
+# ── Narration band ───────────────────────────────────────────────────────────
+
+_NARRATION_COLOR = "&H00F2F0EE"  # soft off-white
+
+
+def _narration_line(segment) -> str:
+    """One ASS Dialogue line for a narration sentence (plain text, gentle fade).
+
+    segment is any object with .text/.start/.end (tts.NarrationSegment).
+    """
+    text = segment.text.replace("\\", "").replace("{", "").replace("}", "")
+    body = "{\\fad(200,200)\\blur0.6}" + text
+    return (
+        f"Dialogue: {_LAYER_NARRATION},"
+        f"{_fmt_time(segment.start)},{_fmt_time(segment.end + 0.25)},"
+        f"Narration,,0,0,0,,{body}"
+    )
+
+
 # ── Public API ───────────────────────────────────────────────────────────────
 
 def build_ass(
@@ -200,19 +223,38 @@ def build_ass(
     title: str | None = None,
     caption_fontsize: int | None = None,
     title_fontsize: int | None = None,
+    narration: list | None = None,
+    layout: dict | None = None,
 ) -> Path:
-    """Write an .ass file with a white-panel title card and sentence-level karaoke captions."""
+    """Write an .ass file with a white-panel title card, sentence-level karaoke
+    captions, and (optionally) the narration text band.
+
+    layout comes from reformat.compose_vertical and pins the caption/narration
+    geometry to the actual video block; without it the classic centred-square
+    geometry is assumed.
+    """
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
-    # The square movie occupies the vertical centre of the frame.
-    # caption_margin_v positions the caption bottom inside that square.
-    sq_offset     = (video_height - video_width) // 2   # y where square starts (e.g. 420 for 1080x1920)
     caption_fontsize  = caption_fontsize  or max(52, video_width // 18)
     title_fontsize    = title_fontsize    or max(44, video_width // 22)
-    # Panel height: snug, fits inside the blurred strip above the square
-    panel_h = max(100, min(sq_offset - 20, video_width // 9))
-    # Caption bottom sits ~100px above the bottom edge of the square
-    caption_margin_v  = sq_offset + 100
+
+    if layout:
+        video_top    = layout["video_top"]
+        video_bottom = layout["video_bottom"]
+        # Panel fits in the blurred strip above the video block
+        panel_h = max(100, min(video_top - 20, video_width // 9))
+        # Dialogue captions sit ~100px above the bottom edge of the video — same
+        # placement as the classic square pipeline
+        caption_margin_v = video_height - video_bottom + 100
+        # Narration text starts a little below the video block (an8 → margin from top)
+        narration_margin_v = video_bottom + 50
+    else:
+        # The square movie occupies the vertical centre of the frame.
+        sq_offset = (video_height - video_width) // 2   # y where square starts (e.g. 420 for 1080x1920)
+        panel_h = max(100, min(sq_offset - 20, video_width // 9))
+        # Caption bottom sits ~100px above the bottom edge of the square
+        caption_margin_v = sq_offset + 100
+        narration_margin_v = sq_offset + video_width + 40
 
     lines = [
         _HEADER.format(
@@ -224,6 +266,9 @@ def build_ass(
             title_fontsize=title_fontsize,
             caption_fontsize=caption_fontsize,
             caption_margin_v=caption_margin_v,
+            narration_fontsize=max(38, video_width // 26),
+            narration_color=_NARRATION_COLOR,
+            narration_margin_v=narration_margin_v,
         )
     ]
 
@@ -233,6 +278,9 @@ def build_ass(
     for i, sentence_words in enumerate(_group_sentences(words)):
         color = _CAPTION_PALETTE[i % len(_CAPTION_PALETTE)]
         lines.append(_sentence_line(sentence_words, color))
+
+    for segment in narration or []:
+        lines.append(_narration_line(segment))
 
     output_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
     return output_path
