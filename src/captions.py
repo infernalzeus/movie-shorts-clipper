@@ -81,7 +81,7 @@ Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour,
 Style: TitleBg,Arial,20,{white},{white},{white},{white},0,0,0,0,100,100,0,0,1,0,0,7,0,0,0,1
 Style: TitleText,Arial Black,{title_fontsize},{black},{black},{white},{black},-1,0,0,0,100,100,0,0,1,0,0,5,40,40,40,1
 Style: Caption,Arial Black,{caption_fontsize},{white},{invisible},{black},{black},-1,0,0,0,100,100,0,0,1,4,0,2,60,60,{caption_margin_v},1
-Style: Narration,Arial,{narration_fontsize},{narration_color},{narration_color},{black},{black},0,0,0,0,100,100,0,0,1,1,0,8,70,70,{narration_margin_v},1
+Style: Narration,Arial,{narration_fontsize},{narration_color},{narration_color},{black},{black},0,0,0,0,100,100,0,0,1,1,0,2,70,70,{narration_margin_v},1
 
 [Events]
 Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
@@ -246,15 +246,16 @@ def build_ass(
         # Dialogue captions sit ~100px above the bottom edge of the video — same
         # placement as the classic square pipeline
         caption_margin_v = video_height - video_bottom + 100
-        # Narration text starts a little below the video block (an8 → margin from top)
-        narration_margin_v = video_bottom + 50
+        # Narration is anchored to the BOTTOM of the screen (an2) — multi-line
+        # text grows upward into the black band rather than crowding the video.
+        narration_margin_v = 70
     else:
         # The square movie occupies the vertical centre of the frame.
         sq_offset = (video_height - video_width) // 2   # y where square starts (e.g. 420 for 1080x1920)
         panel_h = max(100, min(sq_offset - 20, video_width // 9))
         # Caption bottom sits ~100px above the bottom edge of the square
         caption_margin_v = sq_offset + 100
-        narration_margin_v = sq_offset + video_width + 40
+        narration_margin_v = 70
 
     lines = [
         _HEADER.format(

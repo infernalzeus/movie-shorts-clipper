@@ -14,7 +14,7 @@ import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
-DEFAULT_VOICE = "en-US-ChristopherNeural"  # deep documentary-style narrator
+DEFAULT_VOICE = "en-US-JennyNeural"  # female US narrator
 
 # A few good narrator options surfaced in the web UI. Any edge-tts voice id works.
 VOICES = [

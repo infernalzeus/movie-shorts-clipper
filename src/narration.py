@@ -40,7 +40,7 @@ class NarrationBeat:
 
 
 _PROMPT_TEMPLATE = """You are the voice-over narrator for a YouTube Short cut from the film "{title}".
-{context_block}
+{context_block}{scene_block}
 The clip is split into {n} beats, in time order. For each beat you are given the
 dialogue spoken during it. Write ONE narration line per beat that ANALYSES the
 moment — the tension, the power play, the subtext, what a character is really doing
@@ -50,6 +50,12 @@ Rules:
 - Insightful and vivid, not a flat description of the obvious. Present tense, third person.
 - Stay consistent with the dialogue. Do NOT invent concrete physical facts the
   dialogue doesn't support (how many people are present, objects, the exact place).
+- SPEAKER ATTRIBUTION: the subtitles never say who is speaking, and several
+  characters speak in this scene — lines are NOT all from the famous lead. Name a
+  specific character ONLY when the dialogue itself makes it unmistakable (they are
+  addressed by name, or the surrounding dialogue identifies them). Otherwise refer
+  to speakers by role ("the witness", "the prosecutor", "the judge") or neutrally.
+  A wrong name is far worse than no name.
 - Write ONE COMPLETE sentence per beat that fits within its word budget — finish
   the thought; never trail off. Fewer words that complete the idea beat a longer
   sentence that gets cut.
@@ -71,7 +77,8 @@ def _call_ollama(model: str, prompt: str) -> str:
             "prompt": prompt,
             "format": "json",
             "stream": False,
-            "options": {"num_ctx": 8192},
+            # Roomy enough for the surrounding-scene context blocks.
+            "options": {"num_ctx": 16384},
         },
         timeout=300,
     )
@@ -152,8 +159,14 @@ def generate_narration_beats(
     source_title: str,
     clip_duration: float,
     model: str,
+    scene_before: str = "",
+    scene_after: str = "",
 ) -> list[NarrationBeat]:
-    """Return time-anchored narration beats with analytical lines written by the LLM."""
+    """Return time-anchored narration beats with analytical lines written by the LLM.
+
+    scene_before/scene_after: dialogue from the full subtitle file surrounding
+    the clip — the setup usually reveals who is present and who is speaking,
+    which the clip's own lines often don't."""
     beats = build_beats(cues, clip_duration)
     if not beats:
         return []
@@ -163,6 +176,14 @@ def generate_narration_beats(
         f"\nBackground on the film (for names and context):\n{context}\n"
         if context else "\n"
     )
+    scene_block = ""
+    if scene_before:
+        scene_block += (
+            "\nDialogue from the movie right BEFORE this clip (scene setup — use it"
+            f" to work out who is present and who is speaking):\n\"{scene_before}\"\n"
+        )
+    if scene_after:
+        scene_block += f"\nDialogue right AFTER the clip:\n\"{scene_after}\"\n"
 
     beats_block = "\n".join(
         f'Beat {i + 1} (max {b.max_words} words) — dialogue: "{b.dialogue}"'
@@ -171,6 +192,7 @@ def generate_narration_beats(
     prompt = _PROMPT_TEMPLATE.format(
         title=source_title,
         context_block=context_block,
+        scene_block=scene_block,
         n=len(beats),
         beats_block=beats_block,
     )

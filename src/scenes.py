@@ -10,6 +10,7 @@ Used two ways:
 
 import argparse
 import json
+import re
 import sys
 from pathlib import Path
 
@@ -46,6 +47,9 @@ Pick the {count} best self-contained moments for vertical short-form clips. Favo
 - dialogue-dense stretches (the clip gets subtitles burned in)
 
 Each scene must be 20 to 60 seconds long. Use the timestamps shown above.
+Start and end on COMPLETE sentences — never begin or cut off in the middle of
+a line of dialogue. Prefer a natural entry point (a question, a provocation,
+a scene change) and a natural exit (a punchline, a verdict, a door slam).
 
 Respond with ONLY a JSON object in this exact shape:
 {{
@@ -87,12 +91,43 @@ def _condense(cues: list[Cue]) -> str:
     return "\n".join(lines)
 
 
+_SENTENCE_END_RE = re.compile(r"[.!?…][\"'”’)\]]*\s*$")
+_MAX_SENTENCE_WALK = 8   # cues to extend in each direction hunting for sentence ends
+_SENTENCE_GAP = 3.0      # a dialogue gap this long counts as a boundary too
+
+
+def _ends_sentence(text: str) -> bool:
+    return bool(_SENTENCE_END_RE.search(text.strip()))
+
+
 def _snap_to_cues(cues: list[Cue], start: float, end: float) -> tuple[float, float]:
-    """Expand [start, end] to the boundaries of the cues it overlaps, plus padding."""
-    overlapping = [c for c in cues if c.end > start and c.start < end]
-    if overlapping:
-        start = min(start, overlapping[0].start)
-        end = max(end, overlapping[-1].end)
+    """Expand [start, end] to complete-sentence boundaries, plus padding.
+
+    Cue boundaries alone aren't enough — a sentence often spans several cues,
+    so snapping to the overlapping cues still cuts mid-sentence. Walk outward:
+    the start moves back until the PREVIOUS cue ends a sentence (so the clip
+    opens on a sentence start), and the end moves forward until the last
+    included cue ends a sentence. A long dialogue gap also counts as a
+    boundary, and the walk is capped so unpunctuated subtitles can't drag the
+    clip out indefinitely.
+    """
+    idx = [i for i, c in enumerate(cues) if c.end > start and c.start < end]
+    if idx:
+        i, j = idx[0], idx[-1]
+        for _ in range(_MAX_SENTENCE_WALK):
+            if i == 0 or _ends_sentence(cues[i - 1].text):
+                break
+            if cues[i].start - cues[i - 1].end >= _SENTENCE_GAP:
+                break
+            i -= 1
+        for _ in range(_MAX_SENTENCE_WALK):
+            if _ends_sentence(cues[j].text) or j + 1 >= len(cues):
+                break
+            if cues[j + 1].start - cues[j].end >= _SENTENCE_GAP:
+                break
+            j += 1
+        start = min(start, cues[i].start)
+        end = max(end, cues[j].end)
     movie_end = cues[-1].end if cues else end
     return max(0.0, start - _PAD), min(movie_end + 2.0, end + _PAD)
 

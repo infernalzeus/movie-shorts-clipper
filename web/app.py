@@ -13,14 +13,17 @@ Env:  CLIPPER_WEB_HOST (default 0.0.0.0), CLIPPER_WEB_PORT (default 8081),
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import os
 import re
 import subprocess
 import sys
+import urllib.parse
 import uuid
 from pathlib import Path
 
+import aiohttp
 from aiohttp import web, WSMsgType
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -41,16 +44,104 @@ STEP_RE = re.compile(r"^\[(\d+)/(\d+)\]\s*(.*)$")
 SCENES_SCRIPT = SRC_DIR / "scenes.py"
 THUMBNAIL_SCRIPT = SRC_DIR / "thumbnail.py"
 
+# Every full run needs the local Ollama daemon (metadata step always uses it,
+# narration too; cloud models still go through the local daemon). Checking up
+# front — and trying to start it — beats a traceback 10 minutes into a render.
+OLLAMA_VERSION_URL = "http://127.0.0.1:11434/api/version"
+
+
+async def _ollama_up(timeout: float = 1.5) -> bool:
+    try:
+        async with aiohttp.ClientSession() as s:
+            async with s.get(OLLAMA_VERSION_URL, timeout=aiohttp.ClientTimeout(total=timeout)) as r:
+                return r.status == 200
+    except Exception:
+        return False
+
+
+_ollama_spawn_lock = asyncio.Lock()
+
+
+def _spawn_ollama() -> str | None:
+    """Best-effort Ollama launch. Returns an error message, or None if spawned.
+
+    Windows flags matter here: DETACHED_PROCESS would strip the daemon of any
+    console, making every model-runner child it spawns allocate a fresh
+    VISIBLE console — glitchy cmd windows popping up on the desktop.
+    CREATE_NO_WINDOW gives it a hidden console the children inherit instead.
+    Prefer the Ollama desktop app when installed (it manages its own daemon
+    and tray icon — the way Ollama normally runs on this machine).
+    """
+    flags = 0
+    if sys.platform == "win32":
+        flags = subprocess.CREATE_NO_WINDOW | subprocess.CREATE_NEW_PROCESS_GROUP
+        app_exe = Path(os.environ.get("LOCALAPPDATA", "")) / "Programs" / "Ollama" / "ollama app.exe"
+        if app_exe.is_file():
+            try:
+                subprocess.Popen(
+                    [str(app_exe)],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                    creationflags=flags,
+                )
+                return None
+            except Exception:
+                pass  # fall through to the CLI
+    try:
+        subprocess.Popen(
+            ["ollama", "serve"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            creationflags=flags,
+        )
+        return None
+    except FileNotFoundError:
+        return ("Ollama isn't running and the 'ollama' command wasn't found — "
+                "start the Ollama app, then retry.")
+    except Exception as exc:
+        return f"Ollama isn't running and starting it failed ({exc}) — start it manually, then retry."
+
+
+async def _ensure_ollama() -> str | None:
+    """Return None if Ollama is reachable (starting it if needed), else a
+    user-facing error message."""
+    if await _ollama_up():
+        return None
+    # Lock so concurrent requests can't race into spawning multiple daemons.
+    async with _ollama_spawn_lock:
+        if await _ollama_up():
+            return None
+        err = _spawn_ollama()
+        if err:
+            return err
+        for _ in range(20):  # up to ~10s for the daemon to come up
+            await asyncio.sleep(0.5)
+            if await _ollama_up():
+                return None
+    return ("Ollama isn't running (localhost:11434 unreachable) and auto-starting "
+            "it didn't bring it up — start Ollama manually, then retry.")
+
 
 def _clean_path(value: str | None) -> str:
     """Strip whitespace and any surrounding quotes from a pasted file path.
 
     Windows' 'Copy as path' wraps the path in double quotes, and users often
     paste those in — accept the path anyway instead of reporting 'not found'.
+
+    Also accept URL-percent-encoded pastes: some iOS paste targets deliver a
+    copied path as a URL flavor ('\\' as %5C, ' ' as %20) while others paste it
+    plain. A real Windows path never contains %5C/%20/%3A literally, so seeing
+    one means the string is encoded — decode it.
     """
     s = (value or "").strip()
     if len(s) >= 2 and s[0] == s[-1] and s[0] in ("\"", "'"):
         s = s[1:-1]
+    s = s.strip()
+    if re.search(r"%(5C|20|3A|2F)", s, re.IGNORECASE):
+        try:
+            s = urllib.parse.unquote(s)
+        except Exception:
+            pass
+    if s.lower().startswith("file:///"):
+        s = urllib.parse.unquote(s[len("file:///"):]).replace("/", "\\")
     return s.strip()
 
 
@@ -78,6 +169,7 @@ class RunState:
         self.lines: list[str] = []
         self.step: int = 0
         self.total_steps: int = 6
+        self.step_text: str = ""
         self.done: bool = False
         self.ok: bool = False
         self.result: dict = {}
@@ -88,6 +180,7 @@ class RunState:
         self.lines = []
         self.step = 0
         self.total_steps = 6
+        self.step_text = ""
         self.done = False
         self.ok = False
         self.result = {}
@@ -151,8 +244,13 @@ async def _stream_run(args: list[str]) -> None:
             if m:
                 run_state.step = int(m.group(1))
                 run_state.total_steps = int(m.group(2))
+                run_state.step_text = m.group(3).strip().rstrip(".…")
 
-            await _broadcast({"type": "line", "text": line, "step": run_state.step, "total": run_state.total_steps})
+            await _broadcast({
+                "type": "line", "text": line,
+                "step": run_state.step, "total": run_state.total_steps,
+                "step_text": run_state.step_text,
+            })
 
     # main.py's exit — not stdout EOF — is the authoritative completion signal.
     # A stray grandchild (a lingering ffmpeg, an edge-tts SSL transport) can hold
@@ -270,6 +368,9 @@ async def suggest_scenes(request: web.Request) -> web.Response:
 
     if _suggest_lock.locked():
         raise web.HTTPConflict(text="A scene suggestion is already running")
+    ollama_err = await _ensure_ollama()
+    if ollama_err:
+        raise web.HTTPServiceUnavailable(text=ollama_err)
     async with _suggest_lock:
         env = os.environ.copy()
         env["PYTHONIOENCODING"] = "utf-8"
@@ -309,6 +410,23 @@ def _resolve_output(url_or_rel: str) -> Path | None:
     return full
 
 
+def _resolve_prepared_dir(value) -> Path | None:
+    """Validate a prepared clip dir: must sit inside OUTPUT_DIR and still hold
+    the prepared cut. Returns the resolved Path or None."""
+    if not value:
+        return None
+    try:
+        full = Path(str(value)).resolve()
+    except OSError:
+        return None
+    out_root = OUTPUT_DIR.resolve()
+    if full != out_root and out_root not in full.parents:
+        return None
+    if not (full / "clip_raw.mp4").is_file():
+        return None
+    return full
+
+
 _thumb_lock = asyncio.Lock()
 
 
@@ -317,6 +435,7 @@ async def make_thumbnail_route(request: web.Request) -> web.Response:
     """Regenerate the thumbnail from a user-picked frame of the raw clip.
 
     Body: {video: "<served /output url of the raw clip>", at: <seconds>,
+           frame: "<data-URL jpeg of the exact displayed frame>",
            title: "...", movie: "..."}. Writes thumbnail.jpg beside the clip.
     """
     data = await request.json()
@@ -325,17 +444,47 @@ async def make_thumbnail_route(request: web.Request) -> web.Response:
         raise web.HTTPBadRequest(text="Source clip not found")
 
     out_path = src.parent / "thumbnail.jpg"
-    args = [
-        sys.executable, str(THUMBNAIL_SCRIPT),
-        "--video", str(src),
-        "--out", str(out_path),
-    ]
-    at = data.get("at")
-    if at is not None:
+    # The browser sends the exact pixels it is displaying (canvas capture) —
+    # Safari snaps its scrub preview to keyframes, so a plain timestamp grab
+    # can land ~half a second from the frame the user was looking at. When
+    # the original movie path + mapped source time are also provided, the
+    # capture is used to LOCATE that frame in the source and the pixels are
+    # grabbed there at full quality (thumbnail.py --match-image; it falls
+    # back to the capture itself if nothing matches).
+    frame_path: Path | None = None
+    frame_b64 = data.get("frame") or ""
+    if frame_b64:
         try:
-            args += ["--at", f"{float(at):.3f}"]
+            frame_path = src.parent / "_picked_frame.jpg"
+            frame_path.write_bytes(base64.b64decode(frame_b64.split(",", 1)[-1]))
+        except Exception:
+            frame_path = None
+
+    source_video = _clean_path(data.get("source_video"))
+    source_at = data.get("source_at")
+    at = data.get("at")
+
+    grab_video = str(src)
+    frame_args: list[str] = []
+    if frame_path is not None and source_video and Path(source_video).is_file() and source_at is not None:
+        try:
+            frame_args = ["--match-image", str(frame_path), "--at", f"{float(source_at):.3f}"]
+            grab_video = source_video
+        except (TypeError, ValueError):
+            frame_args = ["--image", str(frame_path)]
+    elif frame_path is not None:
+        frame_args = ["--image", str(frame_path)]
+    elif at is not None:
+        try:
+            frame_args = ["--at", f"{float(at):.3f}"]
         except (TypeError, ValueError):
             raise web.HTTPBadRequest(text="Invalid timestamp")
+
+    args = [
+        sys.executable, str(THUMBNAIL_SCRIPT),
+        "--video", grab_video,
+        "--out", str(out_path),
+    ] + frame_args
     pan = data.get("pan")
     if pan is not None:
         try:
@@ -346,6 +495,10 @@ async def make_thumbnail_route(request: web.Request) -> web.Response:
         args += ["--title", str(data["title"])]
     if data.get("movie"):
         args += ["--movie", str(data["movie"])]
+    if data.get("font"):
+        args += ["--font", str(data["font"])]
+    if data.get("color"):
+        args += ["--color", str(data["color"])]
 
     if _thumb_lock.locked():
         raise web.HTTPConflict(text="A thumbnail is already being generated")
@@ -361,6 +514,8 @@ async def make_thumbnail_route(request: web.Request) -> web.Response:
         )
         stdout, stderr = await proc.communicate()
 
+    if frame_path is not None:
+        frame_path.unlink(missing_ok=True)
     if proc.returncode != 0:
         detail = (stderr or stdout or b"").decode(errors="replace")[-800:]
         raise web.HTTPInternalServerError(text=f"thumbnail generation failed:\n{detail}")
@@ -401,7 +556,17 @@ async def prepare(request: web.Request) -> web.Response:
             *args, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
             cwd=str(SRC_DIR), env=env,
         )
-        stdout, _ = await proc.communicate()
+        # Timeout + tree-kill: without this, a cut whose ffmpeg ever stalls
+        # would hold proc.communicate() — and therefore _prepare_lock — forever,
+        # wedging EVERY future prepare into "Already preparing a clip" until the
+        # whole app is restarted. The lock releases on the raised exception.
+        try:
+            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=240)
+        except asyncio.TimeoutError:
+            await _kill_tree(proc)
+            raise web.HTTPGatewayTimeout(
+                text="Preparing the clip stalled and was stopped. Check the source "
+                     "file and ranges, then try again.")
 
     out = stdout.decode(errors="replace")
     if proc.returncode != 0:
@@ -422,6 +587,11 @@ async def prepare(request: web.Request) -> web.Response:
     _prepared["raw_clip_url"] = _rel_output_url(raw_clip)
     return web.json_response({
         "ok": True,
+        # The client holds on to clip_dir and sends it back with /run — the
+        # server-side _prepared global alone is lost on an app restart, which
+        # used to make /run silently render a fresh dir (auto thumbnail
+        # instead of the hand-picked one).
+        "clip_dir": clip_dir,
         "raw_clip_url": _prepared["raw_clip_url"],
         "movie": movie or "",
     })
@@ -461,15 +631,25 @@ async def start_run(request: web.Request) -> web.Response:
         if data.get("tts_voice"):
             args += ["--tts-voice", str(data["tts_voice"])]
         # Two-phase: reuse the prepared cut + hand-picked thumbnail, and bake the
-        # thumbnail into the first 0.5s so it can be chosen on YouTube mobile.
-        if data.get("use_prepared") and _prepared.get("clip_dir"):
-            args += ["--clip-dir", str(_prepared["clip_dir"]), "--prepend-thumbnail"]
+        # thumbnail into the video so it can be chosen on YouTube mobile.
+        # Never fall back silently: rendering without the prepared dir means a
+        # re-cut with an auto-generated thumbnail — not what the user picked.
+        if data.get("use_prepared"):
+            prep = (_resolve_prepared_dir(data.get("prepared_dir"))
+                    or _resolve_prepared_dir(_prepared.get("clip_dir")))
+            if prep is None:
+                raise web.HTTPBadRequest(
+                    text="The prepared clip is no longer available (app restarted?) — "
+                         "click '① Cut clip & pick thumbnail' again.")
+            args += ["--clip-dir", str(prep), "--prepend-thumbnail"]
     if data.get("no_srt"):
         args += ["--no-srt"]
     elif data.get("srt") and Path(str(data["srt"])).is_file():
         args += ["--srt", str(data["srt"])]
     if data.get("layout") in ("square", "vertical"):
         args += ["--layout", data["layout"]]
+    if data.get("remove_silence"):
+        args += ["--remove-silence"]
 
     bg_mode = data.get("bg_mode") or "random"
     if bg_mode == "none":
@@ -480,6 +660,10 @@ async def start_run(request: web.Request) -> web.Response:
             args += ["--bg-music", str(bg_path)]
     if data.get("bg_volume") is not None:
         args += ["--bg-volume", str(data["bg_volume"])]
+
+    ollama_err = await _ensure_ollama()
+    if ollama_err:
+        raise web.HTTPServiceUnavailable(text=ollama_err)
 
     run_state.reset()
     asyncio.create_task(_stream_run(args))
@@ -497,6 +681,7 @@ async def ws_handler(request: web.Request) -> web.WebSocketResponse:
         await ws.send_str(json.dumps({
             "type": "line", "text": line,
             "step": run_state.step, "total": run_state.total_steps,
+            "step_text": run_state.step_text,
         }))
     if run_state.done:
         await ws.send_str(json.dumps({"type": "done", "ok": run_state.ok, "result": run_state.result}))
@@ -521,6 +706,25 @@ async def serve_output(request: web.Request) -> web.StreamResponse:
     return web.FileResponse(full)
 
 
+async def _kill_tree(proc: asyncio.subprocess.Process) -> None:
+    """Kill a subprocess and its whole child tree (the spawned ffmpeg). On
+    Windows terminate() only signals the direct child, so taskkill /T is needed
+    to reap the ffmpeg grandchild too."""
+    if proc.returncode is not None:
+        return
+    try:
+        if sys.platform == "win32":
+            subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)], capture_output=True)
+        else:
+            proc.kill()
+        await asyncio.wait_for(proc.wait(), timeout=5)
+    except Exception:
+        try:
+            proc.kill()
+        except ProcessLookupError:
+            pass
+
+
 async def _terminate_run(app: web.Application) -> None:
     """On shutdown, kill any in-flight render and its whole child tree so a
     stopped/restarted server (e.g. Agent Hub cycling the app) never leaves
@@ -528,23 +732,7 @@ async def _terminate_run(app: web.Application) -> None:
     proc = run_state.proc
     if proc is None or proc.returncode is not None:
         return
-    try:
-        if sys.platform == "win32":
-            # terminate() only signals main.py; taskkill /T reaps the ffmpeg tree.
-            subprocess.run(
-                ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
-                capture_output=True,
-            )
-        else:
-            proc.terminate()
-        await asyncio.wait_for(proc.wait(), timeout=5)
-    except (ProcessLookupError, asyncio.TimeoutError):
-        try:
-            proc.kill()
-        except ProcessLookupError:
-            pass
-    except Exception:
-        pass
+    await _kill_tree(proc)
 
 
 async def _mute_reset_noise(app: web.Application) -> None:
@@ -595,7 +783,9 @@ async def _sigint_wakeup(app: web.Application) -> None:
 
 
 def create_app() -> web.Application:
-    app = web.Application()
+    # client_max_size: /make-thumbnail receives a base64 canvas capture of the
+    # displayed frame — a 4K source frame can exceed aiohttp's 1MB default.
+    app = web.Application(client_max_size=64 * 1024 * 1024)
     app.add_routes(routes)
     app.on_startup.append(_mute_reset_noise)
     if sys.platform == "win32":
@@ -665,6 +855,9 @@ summary{font-size:12px;color:var(--text-muted);cursor:pointer;padding:4px 0}
 #submit:hover:not(:disabled){opacity:.88}
 #submit:disabled{opacity:.4;cursor:not-allowed}
 #progress{display:none;margin-top:18px}
+#step-label{font-size:12.5px;font-weight:600;color:var(--accent);margin-bottom:8px;min-height:16px}
+#step-label.done{color:var(--ok)}
+#step-label.failed{color:var(--err)}
 .steps{display:flex;gap:4px;margin-bottom:12px}
 .step{flex:1;height:5px;border-radius:3px;background:var(--border)}
 .step.active{background:var(--accent)}
@@ -751,15 +944,15 @@ summary{font-size:12px;color:var(--text-muted);cursor:pointer;padding:4px 0}
     <div id="narrate-opts">
       <label for="tts_voice">Narrator voice</label>
       <select id="tts_voice">
-        <option value="en-US-ChristopherNeural" selected>Christopher (US, deep)</option>
+        <option value="en-US-JennyNeural" selected>Jenny (US, female)</option>
+        <option value="en-US-ChristopherNeural">Christopher (US, deep)</option>
         <option value="en-US-GuyNeural">Guy (US)</option>
-        <option value="en-US-JennyNeural">Jenny (US)</option>
         <option value="en-GB-RyanNeural">Ryan (British)</option>
         <option value="en-GB-SoniaNeural">Sonia (British)</option>
         <option value="en-AU-WilliamNeural">William (Australian)</option>
       </select>
-      <label for="narration_volume">Voiceover volume <span id="nvolume-val">0.05</span></label>
-      <input type="range" id="narration_volume" min="0" max="1" step="0.01" value="0.05">
+      <label for="narration_volume">Voiceover volume <span id="nvolume-val">0.04</span></label>
+      <input type="range" id="narration_volume" min="0" max="1" step="0.01" value="0.04">
     </div>
   </fieldset>
 
@@ -786,6 +979,10 @@ summary{font-size:12px;color:var(--text-muted);cursor:pointer;padding:4px 0}
     </div>
     <label for="ollama_model">Ollama model</label>
     <input type="text" id="ollama_model" value="nemotron-3-super:cloud">
+    <label style="display:flex;align-items:center;gap:8px;cursor:pointer;margin-top:12px">
+      <input type="checkbox" id="remove_silence" style="accent-color:var(--accent)">
+      <span>Remove blank spaces — cut gaps where the audio is near-silent (no dialogue)</span>
+    </label>
   </fieldset>
 
   <fieldset>
@@ -824,6 +1021,7 @@ summary{font-size:12px;color:var(--text-muted);cursor:pointer;padding:4px 0}
 <div id="error"></div>
 
 <div id="progress">
+  <div id="step-label"></div>
   <div class="steps" id="steps"></div>
   <div id="log"></div>
 </div>
@@ -850,6 +1048,37 @@ summary{font-size:12px;color:var(--text-muted);cursor:pointer;padding:4px 0}
     <div class="row">
       <div><label for="thumb-title">Title (top)</label><input type="text" id="thumb-title"></div>
       <div><label for="thumb-movie">Movie name (bottom)</label><input type="text" id="thumb-movie"></div>
+    </div>
+    <div class="row">
+      <div>
+        <label for="thumb-font">Font</label>
+        <select id="thumb-font">
+          <option value="impact" selected>Impact (classic)</option>
+          <option value="cooper-black">Cooper Black (chunky retro)</option>
+          <option value="showcard">Showcard Gothic (showbiz)</option>
+          <option value="bernard">Bernard Condensed (poster)</option>
+          <option value="bauhaus">Bauhaus 93 (funky 70s)</option>
+          <option value="broadway">Broadway (art deco)</option>
+          <option value="stencil">Stencil (military)</option>
+          <option value="rockwell">Rockwell (slab serif)</option>
+          <option value="bahnschrift">Bahnschrift (clean)</option>
+          <option value="segoe-black">Segoe Black</option>
+          <option value="arial-black">Arial Black</option>
+          <option value="georgia">Georgia Bold (elegant)</option>
+        </select>
+      </div>
+      <div>
+        <label for="thumb-color">Text color</label>
+        <select id="thumb-color">
+          <option value="white" selected>White</option>
+          <option value="gold">Gold</option>
+          <option value="red">Red</option>
+          <option value="orange">Orange</option>
+          <option value="cyan">Cyan</option>
+          <option value="lime">Lime</option>
+          <option value="pink">Hot pink</option>
+        </select>
+      </div>
     </div>
     <button type="button" id="thumb-grab" class="mini-btn" style="margin-top:8px">📸 Use this frame as thumbnail</button>
     <span id="thumb-status" class="thumb-status"></span>
@@ -881,6 +1110,7 @@ const useSrtWrap = document.getElementById('use-srt-wrap');
 const useSrtChk  = document.getElementById('use_srt');
 const suggestionsEl = document.getElementById('suggestions');
 const stepsEl    = document.getElementById('steps');
+const stepLabel  = document.getElementById('step-label');
 const narrateChk = document.getElementById('narrate');
 const narrateOpts = document.getElementById('narrate-opts');
 const nVolume    = document.getElementById('narration_volume');
@@ -953,6 +1183,21 @@ async function probeVideo() {
     checkSrtBtn.disabled = false;
   }
 }
+// Some iOS paste targets deliver a copied path URL-encoded ('\\' as %5C,
+// ' ' as %20). Decode in place so the user sees the real path immediately.
+function normalizePathInput() {
+  let v = videoInput.value.trim();
+  if (/%(5C|20|3A|2F)/i.test(v)) {
+    try { v = decodeURIComponent(v); } catch (err) {}
+  }
+  if (v.length >= 2 && v[0] === v[v.length - 1] && (v[0] === '"' || v[0] === "'")) {
+    v = v.slice(1, -1);
+  }
+  if (v !== videoInput.value) videoInput.value = v;
+}
+videoInput.addEventListener('input', normalizePathInput);
+videoInput.addEventListener('paste', () => setTimeout(normalizePathInput, 0));
+
 checkSrtBtn.addEventListener('click', probeVideo);
 // Re-checking whenever the path changes keeps stale results from lingering.
 videoInput.addEventListener('change', () => { probedSrt = null; suggestWrap.style.display = 'none';
@@ -1076,7 +1321,11 @@ function connectWs() {
     if (d.type === 'line') {
       appendLog(d.text);
       if (d.total && d.total !== totalSteps) buildSteps(d.total);
-      if (d.step) setStep(d.step);
+      if (d.step) {
+        setStep(d.step);
+        stepLabel.className = '';
+        stepLabel.textContent = `Step ${d.step}/${d.total}` + (d.step_text ? ` — ${d.step_text}` : '');
+      }
     } else if (d.type === 'done') {
       wsHandledDone = true;
       submitBtn.disabled = false;
@@ -1086,8 +1335,13 @@ function connectWs() {
       if (d.ok) {
         renderBtn.style.display = 'none';   // phase-2 done — thumbnail already baked in
         setStep(totalSteps + 1);
+        stepLabel.className = 'done';
+        stepLabel.textContent = `✓ Completed — all ${totalSteps} steps`;
         showResult(d.result);
       } else {
+        stepLabel.className = 'failed';
+        stepLabel.textContent = stepLabel.textContent
+          ? stepLabel.textContent.replace(/^Step /, '✗ Failed at step ') : '✗ Failed';
         errorBox.style.display = 'block';
         errorBox.textContent = 'Pipeline failed — see log above.';
       }
@@ -1100,19 +1354,27 @@ function connectWs() {
 connectWs();
 
 let rawClipUrl = null;
+let preparedDir = null;   // clip dir from /prepare — sent back with /run
+let thumbGrabbed = false; // has the user grabbed a frame since the last prepare?
 function showResult(result) {
   resultEl.style.display = 'block';
   document.getElementById('result-title').textContent = result.title || 'Clip ready';
   const video = document.getElementById('result-video');
   if (result.video_url) { video.src = result.video_url; video.style.display = 'block'; }
+  // Visibility set explicitly BOTH ways — a hidden link from a previous run
+  // must come back when the next run has that artifact.
   const descA = document.getElementById('result-desc');
   const metaA = document.getElementById('result-meta');
-  if (result.description_url) descA.href = result.description_url; else descA.style.display = 'none';
-  if (result.metadata_url) metaA.href = result.metadata_url; else metaA.style.display = 'none';
+  if (result.description_url) { descA.href = result.description_url; descA.style.display = 'inline-block'; }
+  else { descA.style.display = 'none'; }
+  if (result.metadata_url) { metaA.href = result.metadata_url; metaA.style.display = 'inline-block'; }
+  else { metaA.style.display = 'none'; }
   const thumb = document.getElementById('result-thumb');
   if (result.thumbnail_url) { thumb.src = result.thumbnail_url; thumb.style.display = 'block'; }
+  else { thumb.style.display = 'none'; }
   const narrA = document.getElementById('result-narration');
   if (result.narration_url) { narrA.href = result.narration_url; narrA.style.display = 'inline-block'; }
+  else { narrA.style.display = 'none'; }
 
   // Thumbnail frame picker — only when we have the raw (uncropped) clip.
   const editor = document.getElementById('thumb-editor');
@@ -1153,8 +1415,31 @@ thumbVideo.addEventListener('loadedmetadata', () => {
   updateCropbox();
 });
 
-document.getElementById('thumb-grab').addEventListener('click', async () => {
-  if (!rawClipUrl) return;
+function parseTs(s) {
+  const p = String(s || '').trim().split(':').map(Number);
+  if (!p.length || p.some(isNaN)) return null;
+  return p.length === 3 ? p[0] * 3600 + p[1] * 60 + p[2]
+       : p.length === 2 ? p[0] * 60 + p[1] : p[0];
+}
+
+// Map a time on the cut clip's timeline back to the source movie's timeline
+// (the clip is the ranges concatenated in order). Lets the server grab the
+// picked frame from the ORIGINAL movie at full quality.
+function clipTimeToSource(t) {
+  let acc = 0;
+  for (const row of rangesEl.children) {
+    const s = parseTs(row.querySelector('.r-start').value);
+    const e = parseTs(row.querySelector('.r-end').value);
+    if (s == null || e == null || e <= s) continue;
+    const d = e - s;
+    if (t <= acc + d) return s + (t - acc);
+    acc += d;
+  }
+  return null;
+}
+
+async function grabThumbnail() {
+  if (!rawClipUrl) return false;
   const btn = document.getElementById('thumb-grab');
   const status = document.getElementById('thumb-status');
   const at = document.getElementById('thumb-video').currentTime || 0;
@@ -1162,6 +1447,21 @@ document.getElementById('thumb-grab').addEventListener('click', async () => {
   btn.disabled = true;
   status.className = 'thumb-status';
   status.textContent = `Rendering thumbnail at ${at.toFixed(1)}s…`;
+  // Capture the EXACT pixels on screen: Safari's scrub preview snaps to
+  // keyframes, so the frame at `currentTime` can differ from the one being
+  // displayed. The canvas capture is what-you-see-is-what-you-get; the
+  // timestamp goes along only as a fallback.
+  let frame = null;
+  try {
+    const v = document.getElementById('thumb-video');
+    if (v.videoWidth > 0) {
+      const c = document.createElement('canvas');
+      c.width = v.videoWidth;
+      c.height = v.videoHeight;
+      c.getContext('2d').drawImage(v, 0, 0);
+      frame = c.toDataURL('image/jpeg', 0.92);
+    }
+  } catch (err) { frame = null; }
   try {
     const res = await fetch(BASE_PATH + '/make-thumbnail', {
       method: 'POST',
@@ -1170,8 +1470,13 @@ document.getElementById('thumb-grab').addEventListener('click', async () => {
         video: rawClipUrl,
         at,
         pan,
+        frame,
+        source_video: videoInput.value.trim() || null,
+        source_at: clipTimeToSource(at),
         title: document.getElementById('thumb-title').value.trim(),
         movie: document.getElementById('thumb-movie').value.trim(),
+        font: document.getElementById('thumb-font').value,
+        color: document.getElementById('thumb-color').value,
       }),
     });
     if (!res.ok) throw new Error(await res.text() || res.statusText);
@@ -1181,12 +1486,16 @@ document.getElementById('thumb-grab').addEventListener('click', async () => {
     thumb.style.display = 'block';
     status.className = 'thumb-status ok';
     status.textContent = `✓ thumbnail set from ${at.toFixed(1)}s`;
+    thumbGrabbed = true;
+    return true;
   } catch (err) {
     status.textContent = 'Failed: ' + String(err.message).slice(0, 160);
+    return false;
   } finally {
     btn.disabled = false;
   }
-});
+}
+document.getElementById('thumb-grab').addEventListener('click', grabThumbnail);
 
 function buildPayload(ranges, usePrepared) {
   return {
@@ -1207,6 +1516,8 @@ function buildPayload(ranges, usePrepared) {
     srt: (useSrtChk.checked && probedSrt) ? probedSrt : null,
     no_srt: !useSrtChk.checked,
     use_prepared: !!usePrepared,
+    prepared_dir: usePrepared ? preparedDir : null,
+    remove_silence: document.getElementById('remove_silence').checked,
   };
 }
 
@@ -1233,9 +1544,32 @@ form.addEventListener('submit', async (e) => {
   }
 });
 
+function resetRunUi() {
+  // Flush everything a previous run left on screen — its thumbnail, links,
+  // log, and step bars must not leak into the next run's thumbnail picker.
+  const thumb = document.getElementById('result-thumb');
+  thumb.style.display = 'none';
+  thumb.removeAttribute('src');
+  document.getElementById('result-desc').style.display = 'none';
+  document.getElementById('result-meta').style.display = 'none';
+  document.getElementById('result-narration').style.display = 'none';
+  document.getElementById('result-video').style.display = 'none';
+  document.getElementById('thumb-status').className = 'thumb-status';
+  document.getElementById('thumb-status').textContent = '';
+  logEl.textContent = '';
+  setStep(0);
+  stepLabel.className = '';
+  stepLabel.textContent = '';
+  progressEl.style.display = 'none';
+}
+
 async function doPrepare(ranges) {
   resultEl.style.display = 'none';
   document.getElementById('thumb-editor').style.display = 'none';
+  resetRunUi();
+  rawClipUrl = null;
+  preparedDir = null;
+  thumbGrabbed = false;
   submitBtn.disabled = true;
   submitBtn.textContent = 'Cutting clip…';
   try {
@@ -1252,9 +1586,9 @@ async function doPrepare(ranges) {
     const d = await res.json();
     // Reveal the thumbnail picker loaded with the freshly-cut raw clip.
     rawClipUrl = d.raw_clip_url;
+    preparedDir = d.clip_dir || null;
     resultEl.style.display = 'block';
     document.getElementById('result-title').textContent = 'Pick your thumbnail, then render';
-    document.getElementById('result-video').style.display = 'none';
     thumbVideo.src = rawClipUrl;
     document.getElementById('thumb-title').value = '';
     document.getElementById('thumb-movie').value = d.movie || '';
@@ -1274,6 +1608,8 @@ async function doRun(ranges, usePrepared) {
   resultEl.style.display = usePrepared ? 'block' : 'none';
   logEl.textContent = '';
   setStep(0);
+  stepLabel.className = '';
+  stepLabel.textContent = 'Starting…';
   wsHandledDone = false;
   const payload = buildPayload(ranges, usePrepared);
   submitBtn.disabled = true;
@@ -1297,9 +1633,16 @@ async function doRun(ranges, usePrepared) {
   }
 }
 
-document.getElementById('thumb-render').addEventListener('click', () => {
+document.getElementById('thumb-render').addEventListener('click', async () => {
   const ranges = collectRanges();
-  if (ranges) doRun(ranges, true);
+  if (!ranges) return;
+  // Forgot (or skipped) the grab? Bake whatever frame is currently scrubbed —
+  // rendering with an auto-generated thumbnail the user never saw is exactly
+  // the "thumbnail wasn't the one I picked" surprise.
+  if (!thumbGrabbed && rawClipUrl) {
+    await grabThumbnail();
+  }
+  doRun(ranges, true);
 });
 </script>
 </body>

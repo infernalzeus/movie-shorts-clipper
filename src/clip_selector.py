@@ -56,7 +56,20 @@ def cut_and_concat(video_path: Path, ranges: list[tuple[float, float]], output_p
                         "-ss", str(start),
                         "-i", str(video_path),
                         "-t", str(end - start),
-                        "-c:v", "libx264", "-c:a", "aac",
+                        # -ac 2/-ar 48000: movies often carry 5.1 (or oddly
+                        # tagged) audio; without normalizing here the unknown
+                        # 6ch layout survives into burn.py's amix, where the
+                        # AAC encoder refuses to open (exit -22).
+                        # 256k on the first aac generation: this audio gets
+                        # re-encoded twice more (burn mix, thumbnail append) —
+                        # starting from the default 128k audibly smears by then.
+                        # crf 16: this is an intermediate that gets re-encoded
+                        # again at burn time — keep it near-transparent. veryfast
+                        # keeps this near-lossless (crf sets quality; preset only
+                        # trades speed vs size) while keeping the prepare phase
+                        # snappy — medium made the cut slow enough to look hung.
+                        "-c:v", "libx264", "-crf", "16", "-preset", "veryfast",
+                        "-c:a", "aac", "-b:a", "256k", "-ac", "2", "-ar", "48000",
                         "-avoid_negative_ts", "make_zero",
                         str(segment_path),
                     ],

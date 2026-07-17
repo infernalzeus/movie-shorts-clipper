@@ -117,11 +117,14 @@ def append_still_image(
 
     # Both inputs are 9:16; normalise fps/sar/format/audio so concat can join them.
     # Order is video-then-still so the thumbnail lands at the end.
+    # Audio stays at the pipeline's native 48kHz (a 44.1k resample here added a
+    # pointless extra degradation), and this is the mix's THIRD aac generation
+    # — the default 128k bitrate audibly smears at that depth, hence -b:a 192k.
     filter_complex = (
         f"[0:v]scale={width}:{height},setsar=1,fps=30,format=yuv420p[bv];"
         f"[1:v]scale={width}:{height},setsar=1,fps=30,format=yuv420p[tv];"
-        f"[0:a]aformat=sample_rates=44100:channel_layouts=stereo[ba];"
-        f"[2:a]aformat=sample_rates=44100:channel_layouts=stereo[sa];"
+        f"[0:a]aformat=sample_rates=48000:channel_layouts=stereo[ba];"
+        f"[2:a]aformat=sample_rates=48000:channel_layouts=stereo[sa];"
         f"[bv][ba][tv][sa]concat=n=2:v=1:a=1[v][a]"
     )
     try:
@@ -130,10 +133,11 @@ def append_still_image(
                 "ffmpeg", "-y",
                 "-i", str(video_path),
                 "-loop", "1", "-t", f"{duration}", "-i", str(image_path),
-                "-f", "lavfi", "-t", f"{duration}", "-i", "anullsrc=r=44100:cl=stereo",
+                "-f", "lavfi", "-t", f"{duration}", "-i", "anullsrc=r=48000:cl=stereo",
                 "-filter_complex", filter_complex,
                 "-map", "[v]", "-map", "[a]",
-                "-c:v", "libx264", "-crf", "18", "-preset", "fast", "-c:a", "aac",
+                "-c:v", "libx264", "-crf", "18", "-preset", "fast",
+                "-c:a", "aac", "-b:a", "192k",
                 str(tmp_out),
             ],
             check=True, capture_output=True,

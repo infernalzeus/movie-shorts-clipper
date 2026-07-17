@@ -19,7 +19,8 @@ from clip_selector import cut_and_concat, parse_ranges
 from ffutil import get_duration, get_resolution
 from metadata import DEFAULT_MODEL, generate_metadata
 from narration import generate_narration_beats
-from reformat import append_still_image, compose_vertical, crop_to_square
+from reformat import append_still_image
+from silence import detect_silences, keep_intervals, remap_time
 from subtitles import (
     cues_for_ranges,
     cues_from_words,
@@ -118,8 +119,8 @@ def main() -> None:
     # ── narrated-format options ──────────────────────────────────────────────
     parser.add_argument("--narrate", action="store_true",
                         help="Narrated vertical format: LLM scene narration read by TTS + text beneath the video")
-    parser.add_argument("--narration-volume", type=float, default=0.05,
-                        help="Narration voiceover volume 0.0–1.0 (default: 0.05)")
+    parser.add_argument("--narration-volume", type=float, default=0.04,
+                        help="Narration voiceover volume 0.0–1.0 (default: 0.04)")
     parser.add_argument("--tts-voice", default=DEFAULT_VOICE,
                         help=f"edge-tts voice for the narration (default: {DEFAULT_VOICE})")
     parser.add_argument("--srt", default=None,
@@ -134,6 +135,8 @@ def main() -> None:
                         help="Only cut the raw clip into --clip-dir, then exit (for the two-phase thumbnail flow)")
     parser.add_argument("--prepend-thumbnail", action="store_true",
                         help="Bake the thumbnail as the last 0.1s of the final video (pick it as the Short's thumbnail on mobile)")
+    parser.add_argument("--remove-silence", action="store_true",
+                        help="Cut sections where the audio is near-silent (no dialogue) before rendering (default: off)")
     args = parser.parse_args()
 
     video_arg = args.video.strip().strip('"').strip("'") if args.video else None
@@ -178,7 +181,6 @@ def main() -> None:
         clip_dir.mkdir(parents=True, exist_ok=True)
 
     raw_clip_path   = clip_dir / "clip_raw.mp4"
-    framed_path     = clip_dir / ("clip_vertical.mp4" if layout_mode == "vertical" else "clip_square.mp4")
     ass_path        = clip_dir / "captions.ass"
     final_path      = clip_dir / "clip_final.mp4"
     metadata_path   = clip_dir / "metadata.json"
@@ -201,7 +203,10 @@ def main() -> None:
         print(f"  Movie:        {movie_label}")
         return
 
-    total_steps = 6 + (3 if args.narrate else 0) + (1 if args.prepend_thumbnail else 0)
+    # 5 base steps: cut, captions, metadata, build-ass, burn. Framing (square /
+    # vertical canvas) is folded into the burn encode, not a step of its own.
+    total_steps = (5 + (3 if args.narrate else 0) + (1 if args.prepend_thumbnail else 0)
+                   + (1 if args.remove_silence else 0))
     step = StepPrinter(total_steps)
 
     if raw_clip_path.is_file() and args.clip_dir:
@@ -213,25 +218,60 @@ def main() -> None:
         print(f"      -> {raw_clip_path}")
     clip_duration = get_duration(raw_clip_path)
 
+    # Optional silence cut: remove spans where the audio is near-zero (no
+    # dialogue). Subtitle cue times are remapped through silence_keeps below;
+    # the Whisper path needs no remap because it transcribes the trimmed clip.
+    framing_src = raw_clip_path
+    silence_keeps: list[tuple[float, float]] | None = None
+    if args.remove_silence:
+        step("Removing blank spaces (near-silent gaps)...")
+        silences = detect_silences(raw_clip_path)
+        keeps = keep_intervals(clip_duration, silences)
+        removed = clip_duration - sum(e - s for s, e in keeps)
+        if keeps and removed > 0.3:
+            trimmed_path = clip_dir / "clip_trimmed.mp4"
+            cut_and_concat(raw_clip_path, keeps, trimmed_path)
+            silence_keeps = keeps
+            framing_src = trimmed_path
+            clip_duration = get_duration(trimmed_path)
+            print(f"      -> cut {removed:.1f}s across {len(silences)} gap(s), "
+                  f"clip is now {clip_duration:.1f}s -> {trimmed_path.name}")
+        else:
+            print("      -> no silent gaps worth removing")
+
+    # Framing is a filter prefix applied inside the burn encode (one x264
+    # generation instead of two). The vertical layout geometry is fixed
+    # arithmetic, so no probe/encode is needed to know it.
     layout: dict | None = None
     if layout_mode == "vertical":
-        step("Composing 9:16 vertical layout (square crop on black canvas)...")
-        _, layout = compose_vertical(raw_clip_path, framed_path)
-        print(f"      -> {framed_path} (video band {layout['video_top']}–{layout['video_bottom']}px)")
+        frame_w, frame_h = 1080, 1920
+        video_top = (frame_h - frame_w) // 2
+        layout = {"width": frame_w, "height": frame_h,
+                  "video_top": video_top, "video_bottom": video_top + frame_w}
+        pre_filter = (f"crop=min(iw\\,ih):min(iw\\,ih),"
+                      f"scale={frame_w}:{frame_w}:flags=lanczos,"
+                      f"pad={frame_w}:{frame_h}:0:{video_top}:black")
+        frame_size = (frame_w, frame_h)
     else:
-        step(f"Cropping to {args.size}x{args.size} square (center crop)...")
-        crop_to_square(raw_clip_path, framed_path, size=args.size)
-        print(f"      -> {framed_path}")
+        pre_filter = (f"crop=min(iw\\,ih):min(iw\\,ih),"
+                      f"scale={args.size}:{args.size}:flags=lanczos")
+        frame_size = (args.size, args.size)
 
     if srt_path:
         step("Extracting dialogue captions from subtitle file...")
         cues = cues_for_ranges(parse_srt(srt_path), ranges)
+        if silence_keeps:
+            # Shift cue times onto the silence-trimmed timeline (cues sit in
+            # the kept spans by definition — silence has no dialogue).
+            for cue in cues:
+                cue.start = remap_time(cue.start, silence_keeps)
+                cue.end = max(remap_time(cue.end, silence_keeps), cue.start + 0.05)
         words = cues_to_words(cues)
         transcript = cues_to_text(cues)
         print(f"      -> {len(cues)} cues / {len(words)} words from {srt_path.name}")
     else:
         step("Transcribing clip with faster-whisper (no subtitle file found)...")
-        words = transcribe(framed_path, model_size=args.whisper_model, language=args.language, source_title=source_title)
+        words = transcribe(framing_src, model_size=args.whisper_model, language=args.language, source_title=source_title)
         transcript = words_to_text(words)
         cues = cues_from_words(words)
         print(f"      -> {len(words)} words transcribed")
@@ -239,7 +279,18 @@ def main() -> None:
     narration_segments: list = []
     if args.narrate:
         step(f"Writing timed scene narration via Ollama ({args.ollama_model})...")
-        beats = generate_narration_beats(cues, source_title, clip_duration, model=args.ollama_model)
+        # Surrounding dialogue from the full subtitle file — the lead-in usually
+        # names who is present, so the narrator stops guessing the speaker.
+        scene_before = scene_after = ""
+        if srt_path:
+            all_cues = parse_srt(srt_path)
+            first_start, last_end = ranges[0][0], ranges[-1][1]
+            before = [c.text for c in all_cues if first_start - 120 <= c.end <= first_start]
+            after = [c.text for c in all_cues if last_end <= c.start <= last_end + 30]
+            scene_before = " ".join(" ".join(before).split()[-180:])
+            scene_after = " ".join(" ".join(after).split()[:60])
+        beats = generate_narration_beats(cues, source_title, clip_duration, model=args.ollama_model,
+                                         scene_before=scene_before, scene_after=scene_after)
         narration_txt.write_text(
             "\n".join(f"[{b.anchor:05.1f}s] {b.text}" for b in beats),
             encoding="utf-8",
@@ -260,7 +311,7 @@ def main() -> None:
     print(f"      -> {metadata_path}")
 
     step("Building captions + title card...")
-    width, height = get_resolution(framed_path)
+    width, height = frame_size
     build_ass(
         words, ass_path,
         video_width=width, video_height=height,
@@ -270,7 +321,7 @@ def main() -> None:
     )
     print(f"      -> {ass_path}")
 
-    step("Burning captions into video + mixing audio...")
+    step("Framing + burning captions into video + mixing audio...")
     bg_music_path: Path | None = None
     if not args.no_bg_music:
         if args.bg_music:
@@ -294,11 +345,12 @@ def main() -> None:
         print(f"      -> watermark: '{watermark_text}' (fades at 3 s)")
 
     burn_subtitles(
-        framed_path, ass_path, final_path,
+        framing_src, ass_path, final_path,
         bg_music=bg_music_path, bg_volume=args.bg_volume,
         watermark=watermark_text,
         narration_audio=narration_wav if narration_segments else None,
         narration_volume=args.narration_volume,
+        pre_filter=pre_filter,
     )
     print(f"      -> {final_path}")
 

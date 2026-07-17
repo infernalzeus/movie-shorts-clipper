@@ -49,17 +49,24 @@ def burn_subtitles(
     bg_volume: float = 0.10,
     watermark: str | None = None,
     narration_audio: Path | None = None,
-    narration_volume: float = 0.05,
+    narration_volume: float = 0.04,
+    pre_filter: str | None = None,
 ) -> Path:
     """Burn the .ass captions into the video and mix the audio layers:
     movie audio (full, unchanged) + narration voiceover at narration_volume,
-    laid on top + optional looped bg music."""
+    laid on top + optional looped bg music.
+
+    pre_filter: framing filters (square crop / vertical canvas) applied before
+    the captions, so framing and burning happen in ONE encode instead of two —
+    one less lossy x264 generation."""
     output_path.parent.mkdir(parents=True, exist_ok=True)
     ass_arg = _escape_filter_path(ass_path)
 
-    vf = f"ass='{ass_arg}'"
+    vf_parts = [pre_filter] if pre_filter else []
+    vf_parts.append(f"ass='{ass_arg}'")
     if watermark:
-        vf += f",{_watermark_filter(watermark)}"
+        vf_parts.append(_watermark_filter(watermark))
+    vf = ",".join(vf_parts)
     print(f"      [vf] {vf}")
 
     try:
@@ -74,13 +81,21 @@ def burn_subtitles(
             # length (tts.py pads it), so no apad is needed — and an *unbounded*
             # apad here would deadlock amix. bg music is looped then hard-trimmed
             # to the clip length for the same reason.
-            chains = [f"[1:a]volume={narration_volume}[nar]"]
-            mix_labels = "[0:a][nar]"
+            # Every amix input is first normalized to stereo/48k. Movie files
+            # frequently carry 5.1 audio, sometimes with the layout tag lost
+            # ("6 channels (unknown)") — amix then produces a stream the AAC
+            # encoder can't open ("Error while opening encoder", exit -22).
+            norm = "aresample=48000,aformat=channel_layouts=stereo"
+            chains = [
+                f"[0:a]{norm}[a0]",
+                f"[1:a]volume={narration_volume},{norm}[nar]",
+            ]
+            mix_labels = "[a0][nar]"
             n_mix = 2
             if bg_music:
                 inputs += ["-i", str(bg_music)]
                 chains.append(
-                    f"[2:a]aloop=loop=-1:size=2000000000,atrim=0:{dur},volume={bg_volume}[bg]"
+                    f"[2:a]aloop=loop=-1:size=2000000000,atrim=0:{dur},volume={bg_volume},{norm}[bg]"
                 )
                 mix_labels += "[bg]"
                 n_mix = 3
@@ -95,15 +110,19 @@ def burn_subtitles(
                 "-filter_complex", ";".join(chains),
                 "-vf", vf,
                 "-map", "0:v", "-map", "[aout]",
-                "-c:v", "libx264", "-c:a", "aac",
+                "-c:v", "libx264", "-crf", "18", "-preset", "slow",
+                "-c:a", "aac", "-b:a", "192k",
                 str(output_path),
             ])
         elif bg_music:
             dur = _get_duration(video_path)
+            # Same stereo/48k normalization as the narrated branch (see above).
+            norm = "aresample=48000,aformat=channel_layouts=stereo"
             filter_complex = (
+                f"[0:a]{norm}[a0];"
                 f"[1:a]aloop=loop=-1:size=2000000000,atrim=0:{dur},"
-                f"volume={bg_volume}[bg];"
-                f"[0:a][bg]amix=inputs=2:duration=first:dropout_transition=2[aout]"
+                f"volume={bg_volume},{norm}[bg];"
+                f"[a0][bg]amix=inputs=2:duration=first:dropout_transition=2[aout]"
             )
             _run_ffmpeg([
                 "ffmpeg", "-y",
@@ -112,7 +131,8 @@ def burn_subtitles(
                 "-filter_complex", filter_complex,
                 "-vf", vf,
                 "-map", "0:v", "-map", "[aout]",
-                "-c:v", "libx264", "-c:a", "aac",
+                "-c:v", "libx264", "-crf", "18", "-preset", "slow",
+                "-c:a", "aac", "-b:a", "192k",
                 str(output_path),
             ])
         else:
@@ -120,7 +140,8 @@ def burn_subtitles(
                 "ffmpeg", "-y",
                 "-i", str(video_path),
                 "-vf", vf,
-                "-c:v", "libx264", "-c:a", "copy",
+                "-c:v", "libx264", "-crf", "18", "-preset", "slow",
+                "-c:a", "copy",
                 str(output_path),
             ])
     except subprocess.CalledProcessError as e:
