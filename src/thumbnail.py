@@ -54,6 +54,55 @@ COLORS: dict[str, str] = {
     "pink":   "#FF2D95",
 }
 
+# Image enhancement applied to the frame BEFORE the border/text are drawn, so
+# the overlays stay clean. Values are (brightness, contrast, saturation,
+# sharpness) fed to ffmpeg's eq= and unsharp= filters:
+#   brightness -1.0..1.0 (0 = unchanged)   contrast  0..3.0 (1.0 = unchanged)
+#   saturation  0..3.0   (1.0 = unchanged) sharpness 0..2.0 (0 = off)
+# "subtle" is what every thumbnail used to get unconditionally — it stays the
+# default so existing callers render identically.
+ENHANCE_PRESETS: dict[str, dict[str, float]] = {
+    "none":      {"brightness": 0.0,  "contrast": 1.0,  "saturation": 1.0,  "sharpness": 0.0},
+    "subtle":    {"brightness": 0.0,  "contrast": 1.03, "saturation": 1.12, "sharpness": 0.5},
+    "punchy":    {"brightness": 0.03, "contrast": 1.14, "saturation": 1.30, "sharpness": 0.9},
+    "cinematic": {"brightness": -0.02,"contrast": 1.24, "saturation": 0.94, "sharpness": 0.7},
+    "bright":    {"brightness": 0.10, "contrast": 1.06, "saturation": 1.16, "sharpness": 0.6},
+}
+DEFAULT_ENHANCE = "subtle"
+
+
+def _enhance_filters(
+    preset: str = DEFAULT_ENHANCE,
+    brightness: float | None = None,
+    contrast: float | None = None,
+    saturation: float | None = None,
+    sharpness: float | None = None,
+) -> list[str]:
+    """Build the eq=/unsharp= filter steps for the chosen enhancement.
+
+    Any explicit value overrides the preset's, so the UI can offer presets with
+    per-knob tweaks on top. Filters that would be no-ops are dropped rather than
+    passed as identity — an unsharp=...:0 still costs a full convolution pass.
+    """
+    p = dict(ENHANCE_PRESETS.get(preset, ENHANCE_PRESETS[DEFAULT_ENHANCE]))
+    for key, value in (("brightness", brightness), ("contrast", contrast),
+                       ("saturation", saturation), ("sharpness", sharpness)):
+        if value is not None:
+            p[key] = float(value)
+
+    b = min(1.0, max(-1.0, p["brightness"]))
+    c = min(3.0, max(0.0, p["contrast"]))
+    s = min(3.0, max(0.0, p["saturation"]))
+    sharp = min(2.0, max(0.0, p["sharpness"]))
+
+    steps: list[str] = []
+    if sharp > 0:
+        steps.append(f"unsharp=5:5:{sharp:.3f}")
+    if not (abs(b) < 1e-3 and abs(c - 1.0) < 1e-3 and abs(s - 1.0) < 1e-3):
+        steps.append(f"eq=brightness={b:.3f}:contrast={c:.3f}:saturation={s:.3f}")
+    return steps
+
+
 _FALLBACK_FONTS = [
     FONTS["impact"], FONTS["arial-black"], "C:/Windows/Fonts/arialbd.ttf",
     "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
@@ -134,6 +183,11 @@ def make_thumbnail(
     font: str | None = None,
     color: str = "white",
     match_image: Path | None = None,
+    enhance: str = DEFAULT_ENHANCE,
+    brightness: float | None = None,
+    contrast: float | None = None,
+    saturation: float | None = None,
+    sharpness: float | None = None,
 ) -> Path:
     """Write a full-bleed 9:16 .jpg thumbnail from source_video.
 
@@ -164,13 +218,13 @@ def make_thumbnail(
             at, image = None, match_image
 
     # Cover the 9:16 canvas (no bars), then crop to the chosen horizontal
-    # window. Lanczos for crisp downscale; a light sharpen + saturation pop
-    # (before the border/text so those stay clean).
+    # window. Lanczos for crisp downscale; enhancement runs here — before the
+    # border/text are drawn, so those stay clean.
     steps = [
         f"scale={width}:{height}:force_original_aspect_ratio=increase:flags=lanczos",
         f"crop={width}:{height}:x=(in_w-out_w)*{pan:.4f}:y=(in_h-out_h)/2",
-        "unsharp=5:5:0.5,eq=saturation=1.12:contrast=1.03",
     ]
+    steps += _enhance_filters(enhance, brightness, contrast, saturation, sharpness)
     if at is None and image is None:
         steps.insert(0, "thumbnail=250")
 
@@ -272,6 +326,15 @@ def make_thumbnail(
 
 
 def main() -> None:
+    # Handled before argparse so it works without the otherwise-required
+    # --video/--out. Lets the web UI populate its enhancement sliders from THIS
+    # table rather than keeping a second copy that drifts out of sync — it talks
+    # to the pipeline only by shelling out, never by importing it.
+    if "--list-presets" in sys.argv:
+        import json
+        print(json.dumps({"default": DEFAULT_ENHANCE, "presets": ENHANCE_PRESETS}))
+        return
+
     parser = argparse.ArgumentParser(description="Compose a full-bleed 9:16 thumbnail from a movie frame.")
     parser.add_argument("--video", required=True, help="Source clip to grab the frame from")
     parser.add_argument("--out", required=True, help="Output .jpg path")
@@ -283,6 +346,16 @@ def main() -> None:
                         help=f"Text font for title + movie name (default: {DEFAULT_FONT})")
     parser.add_argument("--color", default="white",
                         help=f"Text color: {', '.join(COLORS)} or any ffmpeg color (default: white)")
+    parser.add_argument("--enhance", default=DEFAULT_ENHANCE, choices=list(ENHANCE_PRESETS),
+                        help=f"Image enhancement preset (default: {DEFAULT_ENHANCE})")
+    parser.add_argument("--brightness", type=float, default=None,
+                        help="Override the preset's brightness (-1.0–1.0, 0 = unchanged)")
+    parser.add_argument("--contrast", type=float, default=None,
+                        help="Override the preset's contrast (0.0–3.0, 1.0 = unchanged)")
+    parser.add_argument("--saturation", type=float, default=None,
+                        help="Override the preset's saturation (0.0–3.0, 1.0 = unchanged)")
+    parser.add_argument("--sharpness", type=float, default=None,
+                        help="Override the preset's sharpening (0.0–2.0, 0 = off)")
     parser.add_argument("--pan", type=float, default=0.5, help="Horizontal crop position 0.0–1.0 (default 0.5)")
     parser.add_argument("--title", default=None, help="Title text (overlaid top)")
     parser.add_argument("--movie", default=None, help="Movie name (overlaid bottom)")
@@ -304,7 +377,10 @@ def main() -> None:
 
     out = make_thumbnail(src, Path(args.out), title=args.title, movie=args.movie,
                          at=args.at, pan=args.pan, image=image,
-                         font=args.font, color=args.color, match_image=match_image)
+                         font=args.font, color=args.color, match_image=match_image,
+                         enhance=args.enhance, brightness=args.brightness,
+                         contrast=args.contrast, saturation=args.saturation,
+                         sharpness=args.sharpness)
     print(str(out))
 
 

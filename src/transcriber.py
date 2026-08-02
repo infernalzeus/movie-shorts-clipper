@@ -25,8 +25,14 @@ def transcribe(
 
     model = WhisperModel(model_size, device=device, compute_type=compute_type)
 
-    # Seed Whisper with movie context so proper nouns and dialogue style bias its vocabulary
-    initial_prompt = f"Transcript of dialogue from the movie or show '{source_title}'." if source_title else None
+    # Seed Whisper with movie context so proper nouns and dialogue style bias its vocabulary.
+    # Kept as a bare title (not a full sentence) — a sentence-form prompt like
+    # "Transcript of dialogue from the movie ..." reads to Whisper as the opening line of
+    # a transcript and gets regurgitated verbatim as fake dialogue.
+    initial_prompt = f"Dialogue from '{source_title}'." if source_title else None
+    # Normalised form of the prompt so we can detect and drop any segment that
+    # just parrots it back (a common Whisper hallucination on quiet passages).
+    prompt_norm = _norm(initial_prompt) if initial_prompt else ""
 
     segments, _info = model.transcribe(
         str(video_path),
@@ -37,13 +43,28 @@ def transcribe(
         best_of=5,
         temperature=[0.0, 0.2, 0.4],  # retry with higher randomness on low-confidence segments
         initial_prompt=initial_prompt,
+        # Without this, a single hallucinated prompt-echo becomes the context for
+        # every later segment, so the seed sentence leaks onto EVERY caption.
+        condition_on_previous_text=False,
+        # Skip non-speech spans, where Whisper is most likely to invent the prompt
+        # (or repeated filler) as phantom dialogue.
+        vad_filter=True,
     )
 
     words = []
     for segment in segments:
+        # Drop whole segments that are just the seed prompt echoed back.
+        if prompt_norm and _norm(segment.text) == prompt_norm:
+            continue
         for word in segment.words or []:
             words.append(Word(text=word.word.strip(), start=word.start, end=word.end))
     return words
+
+
+def _norm(text: str) -> str:
+    """Lowercase, strip punctuation/whitespace — for comparing text ignoring formatting."""
+    import re
+    return re.sub(r"[^a-z0-9]+", " ", (text or "").lower()).strip()
 
 
 def words_to_text(words: list[Word]) -> str:

@@ -68,6 +68,17 @@ _CAPTION_PALETTE = [
     "&H0000A5FF",  # orange
 ]
 
+# Named colours (BBGGRR) for the non-shuffle case — one fixed caption colour.
+_CAPTION_COLORS = {
+    "white":  "&H00FFFFFF",
+    "yellow": "&H0000FFFF",
+    "green":  "&H0000FF00",
+    "cyan":   "&H00FFFF00",
+    "pink":   "&H00FF66FF",
+    "orange": "&H0000A5FF",
+}
+CAPTION_ANIMATIONS = ("karaoke", "fade", "pop")
+
 _HEADER = """\
 [Script Info]
 ScriptType: v4.00+
@@ -80,7 +91,7 @@ ScaledBorderAndShadow: yes
 Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
 Style: TitleBg,Arial,20,{white},{white},{white},{white},0,0,0,0,100,100,0,0,1,0,0,7,0,0,0,1
 Style: TitleText,Arial Black,{title_fontsize},{black},{black},{white},{black},-1,0,0,0,100,100,0,0,1,0,0,5,40,40,40,1
-Style: Caption,Arial Black,{caption_fontsize},{white},{invisible},{black},{black},-1,0,0,0,100,100,0,0,1,4,0,2,60,60,{caption_margin_v},1
+Style: Caption,{caption_font},{caption_fontsize},{white},{invisible},{black},{black},-1,0,0,0,100,100,0,0,1,4,0,2,60,60,{caption_margin_v},1
 Style: Narration,Arial,{narration_fontsize},{narration_color},{narration_color},{black},{black},0,0,0,0,100,100,0,0,1,1,0,2,70,70,{narration_margin_v},1
 
 [Events]
@@ -164,29 +175,44 @@ def _group_sentences(
 
 # ── Caption event builder ────────────────────────────────────────────────────
 
-def _sentence_line(sentence_words: list[Word], color: str, fade_out_ms: int = 400) -> str:
-    """One ASS Dialogue line for an entire sentence with per-word karaoke timing.
+def _clean(word: Word) -> str:
+    return _censor_word(word.text.strip()).upper().replace("\\", "").replace("{", "").replace("}", "")
 
-    color overrides PrimaryColour for this line (TikTok-style per-sentence color).
-    A glow effect comes from \\blur softening the (already-set) style outline.
+
+def _sentence_line(
+    sentence_words: list[Word], color: str, fade_out_ms: int = 400, animation: str = "karaoke",
+) -> str:
+    """One ASS Dialogue line for a whole sentence.
+
+    color overrides PrimaryColour for this line. `animation` picks the effect:
+    - karaoke: words light up one-by-one as spoken (\\k per word)
+    - fade:    the whole sentence fades in/out together
+    - pop:     the whole sentence scales up as it fades in
+    A glow comes from \\blur softening the style outline.
     """
     evt_start = sentence_words[0].start
     evt_end   = sentence_words[-1].end + fade_out_ms / 1000
 
-    parts: list[str] = []
-    for k, word in enumerate(sentence_words):
-        # karaoke duration: from this word's start to the next word's start (or word end)
-        if k + 1 < len(sentence_words):
-            dur_s = sentence_words[k + 1].start - word.start
-        else:
-            dur_s = word.end - word.start
-        dur_cs = max(1, round(dur_s * 100))
+    if animation == "karaoke":
+        parts: list[str] = []
+        for k, word in enumerate(sentence_words):
+            # karaoke duration: this word's start to the next word's start (or word end)
+            if k + 1 < len(sentence_words):
+                dur_s = sentence_words[k + 1].start - word.start
+            else:
+                dur_s = word.end - word.start
+            dur_cs = max(1, round(dur_s * 100))
+            parts.append(f"{{\\k{dur_cs}}}{_clean(word)}")
+        body = "{\\fad(250," + str(fade_out_ms) + f")\\c{color}\\blur2" + "}" + " ".join(parts)
+    else:
+        text = " ".join(_clean(w) for w in sentence_words)
+        if animation == "pop":
+            override = ("{\\fad(150," + str(fade_out_ms)
+                       + f")\\c{color}\\blur2\\fscx60\\fscy60\\t(0,160,\\fscx100\\fscy100)" + "}")
+        else:  # "fade" (or any unknown) → plain fade, all words visible at once
+            override = "{\\fad(250," + str(fade_out_ms) + f")\\c{color}\\blur2" + "}"
+        body = override + text
 
-        text = _censor_word(word.text.strip()).upper().replace("\\", "").replace("{", "").replace("}", "")
-        parts.append(f"{{\\k{dur_cs}}}{text}")
-
-    # \fad = fade in/out, \c = per-line text color, \blur = soft glow on the outline
-    body = "{\\fad(250," + str(fade_out_ms) + f")\\c{color}\\blur2" + "}" + " ".join(parts)
     return (
         f"Dialogue: {_LAYER_CAPTION},"
         f"{_fmt_time(evt_start)},{_fmt_time(evt_end)},"
@@ -225,6 +251,10 @@ def build_ass(
     title_fontsize: int | None = None,
     narration: list | None = None,
     layout: dict | None = None,
+    caption_font: str = "Arial Black",
+    caption_animation: str = "karaoke",
+    caption_shuffle: bool = True,
+    caption_color: str = "white",
 ) -> Path:
     """Write an .ass file with a white-panel title card, sentence-level karaoke
     captions, and (optionally) the narration text band.
@@ -265,6 +295,7 @@ def build_ass(
             black=_BLACK,
             invisible=_INVISIBLE,
             title_fontsize=title_fontsize,
+            caption_font=caption_font,
             caption_fontsize=caption_fontsize,
             caption_margin_v=caption_margin_v,
             narration_fontsize=max(38, video_width // 26),
@@ -276,9 +307,10 @@ def build_ass(
     if title:
         lines.extend(_title_card_lines(title, video_width, panel_h))
 
+    fixed_color = _CAPTION_COLORS.get(caption_color, _WHITE)
     for i, sentence_words in enumerate(_group_sentences(words)):
-        color = _CAPTION_PALETTE[i % len(_CAPTION_PALETTE)]
-        lines.append(_sentence_line(sentence_words, color))
+        color = _CAPTION_PALETTE[i % len(_CAPTION_PALETTE)] if caption_shuffle else fixed_color
+        lines.append(_sentence_line(sentence_words, color, animation=caption_animation))
 
     for segment in narration or []:
         lines.append(_narration_line(segment))

@@ -43,6 +43,7 @@ STEP_RE = re.compile(r"^\[(\d+)/(\d+)\]\s*(.*)$")
 
 SCENES_SCRIPT = SRC_DIR / "scenes.py"
 THUMBNAIL_SCRIPT = SRC_DIR / "thumbnail.py"
+METADATA_SCRIPT = SRC_DIR / "metadata.py"
 
 # Every full run needs the local Ollama daemon (metadata step always uses it,
 # narration too; cloud models still go through the local daemon). Checking up
@@ -168,7 +169,10 @@ class RunState:
         self.proc: asyncio.subprocess.Process | None = None
         self.lines: list[str] = []
         self.step: int = 0
-        self.total_steps: int = 6
+        # Set per-run from _expected_steps() and corrected by the first '[n/N]'
+        # line main.py prints. The old hardcoded 6 predated narration and was
+        # simply wrong: a narrated run with thumbnail baking is 9.
+        self.total_steps: int = 0
         self.step_text: str = ""
         self.done: bool = False
         self.ok: bool = False
@@ -179,7 +183,7 @@ class RunState:
         self.proc = None
         self.lines = []
         self.step = 0
-        self.total_steps = 6
+        self.total_steps = 0
         self.step_text = ""
         self.done = False
         self.ok = False
@@ -189,7 +193,9 @@ class RunState:
 run_state = RunState()
 
 # Phase-1 "prepared" clip (cut, awaiting a thumbnail pick before the full render).
-_prepared: dict = {"clip_dir": None, "raw_clip_url": None}
+# video/ranges record what the cut was made FROM, so /run can refuse to reuse it
+# for a different request instead of rendering the old clip's footage.
+_prepared: dict = {"clip_dir": None, "raw_clip_url": None, "video": None, "ranges": None}
 _prepare_lock = asyncio.Lock()
 
 
@@ -217,6 +223,10 @@ async def _stream_run(args: list[str]) -> None:
     cmd = [sys.executable, str(MAIN_SCRIPT)] + args
     env = os.environ.copy()
     env["PYTHONIOENCODING"] = "utf-8"
+    # Unbuffered: stdout is a pipe here, and Python block-buffers pipes (~8KB).
+    # Without this the '[n/N]' progress lines sit in the buffer and flush in one
+    # burst at the end, so the UI's step bar never moves during the run.
+    env["PYTHONUNBUFFERED"] = "1"
 
     # New process group on Windows so we can kill the whole ffmpeg/edge-tts tree
     # on shutdown (see _terminate_run) rather than leaving orphans behind.
@@ -330,6 +340,22 @@ async def audio_files(request: web.Request) -> web.Response:
     return web.json_response(files)
 
 
+@routes.get("/enhance-presets")
+async def enhance_presets(request: web.Request) -> web.Response:
+    """The thumbnail enhancement presets, straight from thumbnail.py, so the UI's
+    sliders can't drift from the values the pipeline actually applies."""
+    proc = await asyncio.create_subprocess_exec(
+        sys.executable, str(THUMBNAIL_SCRIPT), "--list-presets",
+        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
+        cwd=str(SRC_DIR),
+    )
+    stdout, _ = await proc.communicate()
+    try:
+        return web.json_response(json.loads(stdout.decode(errors="replace").strip()))
+    except (json.JSONDecodeError, AttributeError):
+        raise web.HTTPInternalServerError(text="could not read enhancement presets")
+
+
 @routes.get("/status")
 async def status(request: web.Request) -> web.Response:
     busy = run_state.proc is not None and run_state.proc.returncode is None
@@ -393,6 +419,71 @@ async def suggest_scenes(request: web.Request) -> web.Response:
     return web.json_response(payload)
 
 
+_titles_lock = asyncio.Lock()
+
+
+@routes.post("/suggest-titles")
+async def suggest_titles(request: web.Request) -> web.Response:
+    """Propose on-screen title options for the clip, at thumbnail-pick time.
+
+    Reads the dialogue straight out of the subtitle file for the chosen ranges,
+    so this is a single LLM call rather than a transcription — fast enough to sit
+    in front of the render, where the choice can still be applied.
+    """
+    data = await request.json()
+    # Only use a subtitle file the caller actually SELECTED for this clip — never
+    # fall back to some other .srt in the folder. When none is selected we pull
+    # the dialogue from the already-cut clip with Whisper instead, so the titles
+    # describe THIS clip, not whatever subtitle happened to be lying around.
+    srt = (data.get("srt") or "").strip()
+    ranges = (data.get("ranges") or "").strip()
+    raw_clip = _resolve_output(data.get("raw_clip") or "")
+
+    args = [
+        sys.executable, str(METADATA_SCRIPT),
+        "--titles", str(int(data.get("count") or 5)),
+    ]
+    if srt and Path(srt).is_file():
+        if not ranges:
+            raise web.HTTPBadRequest(text="At least one range is required")
+        args += ["--srt", srt, "--ranges", ranges]
+    elif raw_clip is not None and raw_clip.is_file():
+        args += ["--clip", str(raw_clip),
+                 "--whisper-model", str(data.get("whisper_model") or "medium"),
+                 "--language", str(data.get("language") or "en")]
+    else:
+        raise web.HTTPBadRequest(
+            text="No subtitle selected and the cut clip isn't available yet — "
+                 "cut the clip first (it's transcribed for the title options).")
+    if data.get("source_title"):
+        args += ["--source-title", str(data["source_title"])]
+    if data.get("model"):
+        args += ["--model", str(data["model"])]
+
+    if _titles_lock.locked():
+        raise web.HTTPConflict(text="Title options are already being generated")
+    ollama_err = await _ensure_ollama()
+    if ollama_err:
+        raise web.HTTPServiceUnavailable(text=ollama_err)
+    async with _titles_lock:
+        env = os.environ.copy()
+        env["PYTHONIOENCODING"] = "utf-8"
+        proc = await asyncio.create_subprocess_exec(
+            *args, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+            cwd=str(SRC_DIR), env=env,
+        )
+        stdout, stderr = await proc.communicate()
+
+    if proc.returncode != 0:
+        detail = (stderr or stdout or b"").decode(errors="replace")[-800:]
+        raise web.HTTPInternalServerError(text=f"title suggestion failed:\n{detail}")
+    try:
+        payload = json.loads(stdout.decode(errors="replace").strip().splitlines()[-1])
+    except (json.JSONDecodeError, IndexError):
+        raise web.HTTPInternalServerError(text="title suggestion returned unparseable output")
+    return web.json_response(payload)
+
+
 def _resolve_output(url_or_rel: str) -> Path | None:
     """Map a served /output/... URL (or bare relative path) back to a disk path,
     guarding against escaping OUTPUT_DIR."""
@@ -425,6 +516,20 @@ def _resolve_prepared_dir(value) -> Path | None:
     if not (full / "clip_raw.mp4").is_file():
         return None
     return full
+
+
+def _prepared_ranges_for(prep: Path, client_claim) -> str | None:
+    """The ranges string the prepared cut in `prep` was actually cut from.
+
+    Prefers this process's own record of the prepare; falls back to what the
+    client says it prepared with (the record is lost on an app restart, but the
+    clip dir on disk isn't). None means unknowable — main.py's prepare.json
+    check is the backstop in that case.
+    """
+    if _prepared.get("clip_dir") and _resolve_prepared_dir(_prepared["clip_dir"]) == prep:
+        return _prepared.get("ranges")
+    claim = (client_claim or "").strip()
+    return claim or None
 
 
 _thumb_lock = asyncio.Lock()
@@ -499,6 +604,17 @@ async def make_thumbnail_route(request: web.Request) -> web.Response:
         args += ["--font", str(data["font"])]
     if data.get("color"):
         args += ["--color", str(data["color"])]
+    if data.get("enhance"):
+        args += ["--enhance", str(data["enhance"])]
+    # Per-knob overrides on top of the preset. Sent only when the user has opened
+    # the advanced sliders, so a plain preset pick stays a plain preset pick.
+    for key, flag in (("brightness", "--brightness"), ("contrast", "--contrast"),
+                      ("saturation", "--saturation"), ("sharpness", "--sharpness")):
+        if data.get(key) is not None:
+            try:
+                args += [flag, f"{float(data[key]):.3f}"]
+            except (TypeError, ValueError):
+                raise web.HTTPBadRequest(text=f"Invalid {key}")
 
     if _thumb_lock.locked():
         raise web.HTTPConflict(text="A thumbnail is already being generated")
@@ -585,8 +701,13 @@ async def prepare(request: web.Request) -> web.Response:
 
     _prepared["clip_dir"] = clip_dir
     _prepared["raw_clip_url"] = _rel_output_url(raw_clip)
+    _prepared["video"] = video
+    _prepared["ranges"] = ranges
     return web.json_response({
         "ok": True,
+        # Echoed back with /run so a render can be refused when the ranges were
+        # edited after cutting (the reused cut would be the old footage).
+        "prepared_ranges": ranges,
         # The client holds on to clip_dir and sends it back with /run — the
         # server-side _prepared global alone is lost on an app restart, which
         # used to make /run silently render a fresh dir (auto thumbnail
@@ -595,6 +716,20 @@ async def prepare(request: web.Request) -> web.Response:
         "raw_clip_url": _prepared["raw_clip_url"],
         "movie": movie or "",
     })
+
+
+def _expected_steps(args: list[str]) -> int:
+    """How many '[n/N]' steps the run we're about to spawn will print.
+
+    Mirrors main.py's total_steps formula, read off the flags actually being
+    passed, so the UI draws the right number of segments from the first paint
+    instead of jumping when the real total arrives on the '[1/N]' line.
+    """
+    return (5
+            + (1 if "--remove-silence" in args else 0)
+            + (2 if "--narrate" in args else 0)                 # narration beats + voiceover
+            + (1 if ("--narrate" in args or "--prepend-thumbnail" in args) else 0)  # compose/use thumbnail
+            + (1 if "--prepend-thumbnail" in args else 0))      # bake thumbnail into video
 
 
 @routes.post("/run")
@@ -615,6 +750,9 @@ async def start_run(request: web.Request) -> web.Response:
 
     if data.get("source_title"):
         args += ["--source-title", str(data["source_title"])]
+    # Title picked (or typed) in the thumbnail editor — overrides the LLM's.
+    if (data.get("title") or "").strip():
+        args += ["--title", str(data["title"]).strip()]
     args += ["--whisper-model", data.get("whisper_model") or "medium"]
     args += ["--ollama-model", data.get("ollama_model") or "nemotron-3-super:cloud"]
     args += ["--language", data.get("language") or "en"]
@@ -630,28 +768,58 @@ async def start_run(request: web.Request) -> web.Response:
             args += ["--narration-volume", str(data["narration_volume"])]
         if data.get("tts_voice"):
             args += ["--tts-voice", str(data["tts_voice"])]
-        # Two-phase: reuse the prepared cut + hand-picked thumbnail, and bake the
-        # thumbnail into the video so it can be chosen on YouTube mobile.
-        # Never fall back silently: rendering without the prepared dir means a
-        # re-cut with an auto-generated thumbnail — not what the user picked.
-        if data.get("use_prepared"):
-            prep = (_resolve_prepared_dir(data.get("prepared_dir"))
-                    or _resolve_prepared_dir(_prepared.get("clip_dir")))
-            if prep is None:
-                raise web.HTTPBadRequest(
-                    text="The prepared clip is no longer available (app restarted?) — "
-                         "click '① Cut clip & pick thumbnail' again.")
-            args += ["--clip-dir", str(prep), "--prepend-thumbnail"]
+
+    # Two-phase applies to EVERY run now (narrated or classic): reuse the
+    # prepared cut + hand-picked thumbnail, and bake the thumbnail into the video
+    # so it can be chosen as the Short's thumbnail on YouTube mobile. Never fall
+    # back silently: rendering without the prepared dir means a re-cut with an
+    # auto-generated thumbnail — not what the user picked.
+    if data.get("use_prepared"):
+        # Only the client's own prepared_dir — NEVER fall back to the server-side
+        # _prepared global. That global outlives the page and can point at a
+        # completely different clip from an earlier session, which renders that
+        # clip's footage under this clip's ranges.
+        prep = _resolve_prepared_dir(data.get("prepared_dir"))
+        if prep is None:
+            raise web.HTTPBadRequest(
+                text="The prepared clip is no longer available (app restarted?) — "
+                     "click '① Cut clip & pick thumbnail' again.")
+        # The cut is fixed at prepare time; the ranges below drive captions and
+        # narration. If they've diverged, the video and the dialogue would come
+        # from different clips — refuse rather than mismatch.
+        prepared_ranges = _prepared_ranges_for(prep, data.get("prepared_ranges"))
+        if prepared_ranges is not None and prepared_ranges != ranges:
+            raise web.HTTPBadRequest(
+                text=f"The ranges changed since you cut the clip "
+                     f"(cut from '{prepared_ranges}', now '{ranges}'). "
+                     f"Click '① Cut clip & pick thumbnail' again to re-cut and "
+                     f"re-pick the thumbnail.")
+        args += ["--clip-dir", str(prep), "--prepend-thumbnail"]
     if data.get("no_srt"):
         args += ["--no-srt"]
     elif data.get("srt") and Path(str(data["srt"])).is_file():
         args += ["--srt", str(data["srt"])]
-    if data.get("layout") in ("square", "vertical"):
-        args += ["--layout", data["layout"]]
+    # Output shape: 9:16 vertical by default; the Square checkbox forces 1:1.
+    # Narration needs the vertical band beneath the video, so a narrated edit is
+    # always vertical regardless of the checkbox.
+    layout = "square" if (data.get("square") and not data.get("narrate")) else "vertical"
+    args += ["--layout", layout]
     if data.get("remove_silence"):
         args += ["--remove-silence"]
 
-    bg_mode = data.get("bg_mode") or "random"
+    # Caption style options
+    if data.get("caption_font"):
+        args += ["--caption-font", str(data["caption_font"])]
+    if data.get("caption_animation"):
+        args += ["--caption-animation", str(data["caption_animation"])]
+    if data.get("caption_color"):
+        args += ["--caption-color", str(data["caption_color"])]
+    if data.get("caption_shuffle") is False:
+        args += ["--no-caption-shuffle"]
+    if data.get("mirror"):
+        args += ["--mirror"]
+
+    bg_mode = data.get("bg_mode") or "none"
     if bg_mode == "none":
         args += ["--no-bg-music"]
     elif bg_mode == "file" and data.get("bg_music"):
@@ -660,15 +828,24 @@ async def start_run(request: web.Request) -> web.Response:
             args += ["--bg-music", str(bg_path)]
     if data.get("bg_volume") is not None:
         args += ["--bg-volume", str(data["bg_volume"])]
+    # Skip a lead-in on the background track (random or specific file); ignored
+    # when bg music is off.
+    if bg_mode != "none" and data.get("bg_skip") is not None:
+        try:
+            if float(data["bg_skip"]) > 0:
+                args += ["--bg-skip", str(data["bg_skip"])]
+        except (TypeError, ValueError):
+            pass
 
     ollama_err = await _ensure_ollama()
     if ollama_err:
         raise web.HTTPServiceUnavailable(text=ollama_err)
 
     run_state.reset()
+    run_state.total_steps = _expected_steps(args)
     asyncio.create_task(_stream_run(args))
 
-    return web.json_response({"ok": True})
+    return web.json_response({"ok": True, "total_steps": run_state.total_steps})
 
 
 @routes.get("/ws")
@@ -983,22 +1160,69 @@ summary{font-size:12px;color:var(--text-muted);cursor:pointer;padding:4px 0}
       <input type="checkbox" id="remove_silence" style="accent-color:var(--accent)">
       <span>Remove blank spaces — cut gaps where the audio is near-silent (no dialogue)</span>
     </label>
+    <label style="display:flex;align-items:center;gap:8px;cursor:pointer;margin-top:12px">
+      <input type="checkbox" id="mirror" style="accent-color:var(--accent)">
+      <span>Mirror clip — flip the footage left-right (captions &amp; narration stay upright)</span>
+    </label>
+    <label style="display:flex;align-items:center;gap:8px;cursor:pointer;margin-top:12px">
+      <input type="checkbox" id="square" style="accent-color:var(--accent)">
+      <span>Square output (1:1) — otherwise 9:16 vertical (ignored when narration is on)</span>
+    </label>
+  </fieldset>
+
+  <fieldset>
+    <legend>Captions</legend>
+    <label for="caption_font">Font</label>
+    <select id="caption_font">
+      <option value="Arial Black" selected>Arial Black</option>
+      <option value="Impact">Impact</option>
+      <option value="Verdana">Verdana</option>
+      <option value="Tahoma">Tahoma</option>
+      <option value="Trebuchet MS">Trebuchet MS</option>
+      <option value="Georgia">Georgia</option>
+      <option value="Comic Sans MS">Comic Sans MS</option>
+    </select>
+    <label for="caption_animation" style="margin-top:12px">Effect</label>
+    <select id="caption_animation">
+      <option value="karaoke" selected>Karaoke — words light up one by one</option>
+      <option value="fade">Fade — whole line fades in</option>
+      <option value="pop">Pop — whole line scales in</option>
+    </select>
+    <label style="display:flex;align-items:center;gap:8px;cursor:pointer;margin-top:12px">
+      <input type="checkbox" id="caption_shuffle" checked style="accent-color:var(--accent)">
+      <span>Shuffle colours — cycle a different colour each sentence</span>
+    </label>
+    <div id="caption_color_wrap" style="display:none;margin-top:10px">
+      <label for="caption_color">Fixed colour</label>
+      <select id="caption_color">
+        <option value="white" selected>White</option>
+        <option value="yellow">Yellow</option>
+        <option value="green">Green</option>
+        <option value="cyan">Cyan</option>
+        <option value="pink">Pink</option>
+        <option value="orange">Orange</option>
+      </select>
+    </div>
   </fieldset>
 
   <fieldset>
     <legend>Background music</legend>
     <label for="bg_mode">Mode</label>
     <select id="bg_mode">
-      <option value="random" selected>Random from audio/</option>
+      <option value="none" selected>None</option>
+      <option value="random">Random from audio/</option>
       <option value="file">Specific file</option>
-      <option value="none">None</option>
     </select>
     <div id="bg-file-wrap" style="display:none">
       <label for="bg_music">File</label>
       <select id="bg_music"></select>
     </div>
-    <label for="bg_volume">Volume <span id="volume-val">0.10</span></label>
-    <input type="range" id="bg_volume" min="0" max="1" step="0.01" value="0.10">
+    <div id="bg-audio-opts" style="display:none">
+      <label for="bg_volume">Volume <span id="volume-val">0.10</span></label>
+      <input type="range" id="bg_volume" min="0" max="1" step="0.01" value="0.10">
+      <label for="bg_skip">Skip first N seconds of the track (cut a slow intro)</label>
+      <input type="number" id="bg_skip" min="0" step="0.5" value="0" placeholder="0">
+    </div>
   </fieldset>
 
   <details>
@@ -1015,7 +1239,7 @@ summary{font-size:12px;color:var(--text-muted);cursor:pointer;padding:4px 0}
     </div>
   </details>
 
-  <button type="submit" id="submit">Generate Clip</button>
+  <button type="submit" id="submit">① Cut clip &amp; pick thumbnail</button>
 </form>
 
 <div id="error"></div>
@@ -1046,9 +1270,11 @@ summary{font-size:12px;color:var(--text-muted);cursor:pointer;padding:4px 0}
     <label for="thumb-pan">Crop position <span id="thumb-pan-val">center</span></label>
     <input type="range" id="thumb-pan" min="0" max="100" value="50">
     <div class="row">
-      <div><label for="thumb-title">Title (top)</label><input type="text" id="thumb-title"></div>
+      <div><label for="thumb-title">Title (top of thumbnail + burned into the video)</label><input type="text" id="thumb-title"></div>
       <div><label for="thumb-movie">Movie name (bottom)</label><input type="text" id="thumb-movie"></div>
     </div>
+    <button type="button" id="title-suggest" class="mini-btn" style="margin-top:8px">✨ Suggest titles</button>
+    <div id="title-options"></div>
     <div class="row">
       <div>
         <label for="thumb-font">Font</label>
@@ -1080,6 +1306,26 @@ summary{font-size:12px;color:var(--text-muted);cursor:pointer;padding:4px 0}
         </select>
       </div>
     </div>
+    <label for="thumb-enhance">Image enhancement</label>
+    <select id="thumb-enhance">
+      <option value="subtle" selected>Subtle — light sharpen + colour pop</option>
+      <option value="punchy">Punchy — brighter, bold colour, crisp</option>
+      <option value="cinematic">Cinematic — deep contrast, cooler colour</option>
+      <option value="bright">Bright — lift dark night scenes</option>
+      <option value="none">None — untouched frame</option>
+    </select>
+    <details id="thumb-enhance-adv">
+      <summary>Fine-tune brightness / contrast / saturation / sharpness</summary>
+      <label for="thumb-brightness">Brightness <span id="thumb-brightness-val"></span></label>
+      <input type="range" id="thumb-brightness" min="-0.4" max="0.4" step="0.01">
+      <label for="thumb-contrast">Contrast <span id="thumb-contrast-val"></span></label>
+      <input type="range" id="thumb-contrast" min="0.5" max="2" step="0.01">
+      <label for="thumb-saturation">Saturation <span id="thumb-saturation-val"></span></label>
+      <input type="range" id="thumb-saturation" min="0" max="2.5" step="0.01">
+      <label for="thumb-sharpness">Sharpness <span id="thumb-sharpness-val"></span></label>
+      <input type="range" id="thumb-sharpness" min="0" max="2" step="0.05">
+      <button type="button" id="thumb-enhance-reset" class="mini-btn" style="margin-top:8px">↺ Back to preset</button>
+    </details>
     <button type="button" id="thumb-grab" class="mini-btn" style="margin-top:8px">📸 Use this frame as thumbnail</button>
     <span id="thumb-status" class="thumb-status"></span>
     <button type="button" id="thumb-render" style="display:none">② Render final video →</button>
@@ -1117,7 +1363,9 @@ const nVolume    = document.getElementById('narration_volume');
 const nVolumeVal = document.getElementById('nvolume-val');
 
 let probedSrt = null;
-let totalSteps = 6;
+// Real total comes from /run (and is confirmed by the first '[n/N]' log line).
+// Never hardcode it — it varies with narration / thumbnail baking / silence removal.
+let totalSteps = 0;
 
 function addRangeRow(start, end) {
   const row = document.createElement('div');
@@ -1136,9 +1384,14 @@ function addRangeRow(start, end) {
 addRangeRow();
 document.getElementById('add-range').onclick = () => addRangeRow();
 
-bgMode.addEventListener('change', () => {
+const bgAudioOpts = document.getElementById('bg-audio-opts');
+function syncBgMode() {
   bgFileWrap.style.display = bgMode.value === 'file' ? 'block' : 'none';
-});
+  // Volume + skip-intro only matter when background music is actually on.
+  bgAudioOpts.style.display = bgMode.value === 'none' ? 'none' : 'block';
+}
+bgMode.addEventListener('change', syncBgMode);
+syncBgMode();
 bgVolume.addEventListener('input', () => { volumeVal.textContent = bgVolume.value; });
 nVolume.addEventListener('input', () => { nVolumeVal.textContent = nVolume.value; });
 narrateChk.addEventListener('change', () => {
@@ -1283,6 +1536,7 @@ function collectRanges() {
 }
 
 function buildSteps(total) {
+  if (!total || total === totalSteps) return;
   totalSteps = total;
   stepsEl.innerHTML = '';
   for (let i = 1; i <= total; i++) {
@@ -1292,7 +1546,6 @@ function buildSteps(total) {
     stepsEl.appendChild(div);
   }
 }
-buildSteps(6);
 
 function setStep(n) {
   document.querySelectorAll('.step').forEach(el => {
@@ -1320,7 +1573,7 @@ function connectWs() {
     const d = JSON.parse(ev.data);
     if (d.type === 'line') {
       appendLog(d.text);
-      if (d.total && d.total !== totalSteps) buildSteps(d.total);
+      buildSteps(d.total);
       if (d.step) {
         setStep(d.step);
         stepLabel.className = '';
@@ -1354,8 +1607,9 @@ function connectWs() {
 connectWs();
 
 let rawClipUrl = null;
-let preparedDir = null;   // clip dir from /prepare — sent back with /run
-let thumbGrabbed = false; // has the user grabbed a frame since the last prepare?
+let preparedDir = null;    // clip dir from /prepare — sent back with /run
+let preparedRanges = null; // the ranges that dir was cut from — /run refuses a mismatch
+let thumbGrabbed = false;  // has the user grabbed a frame since the last prepare?
 function showResult(result) {
   resultEl.style.display = 'block';
   document.getElementById('result-title').textContent = result.title || 'Clip ready';
@@ -1414,6 +1668,118 @@ thumbVideo.addEventListener('loadedmetadata', () => {
   cropWidthFrac = Math.min(1, (9 / 16) / aspect);
   updateCropbox();
 });
+
+// ── Title options ───────────────────────────────────────────────────────────
+const titleSuggestBtn = document.getElementById('title-suggest');
+const titleOptionsEl  = document.getElementById('title-options');
+
+titleSuggestBtn.addEventListener('click', async () => {
+  const ranges = collectRanges();
+  if (!ranges) {
+    titleOptionsEl.innerHTML = '<div class="suggestion" style="cursor:default;color:var(--err)">Add a clip range first.</div>';
+    return;
+  }
+  titleSuggestBtn.disabled = true;
+  titleSuggestBtn.textContent = '⏳ Writing title options…';
+  titleOptionsEl.innerHTML = '';
+  try {
+    const res = await fetch(BASE_PATH + '/suggest-titles', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({
+        // Only pass the subtitle when it's the one selected for captions —
+        // otherwise let the server transcribe the cut clip so the titles
+        // describe THIS clip, not an unrelated .srt.
+        srt: (useSrtChk.checked && probedSrt) ? probedSrt : null,
+        ranges,
+        raw_clip: rawClipUrl,
+        whisper_model: document.getElementById('whisper_model').value,
+        language: document.getElementById('language').value.trim(),
+        source_title: document.getElementById('source_title').value.trim()
+          || document.getElementById('thumb-movie').value.trim(),
+        model: document.getElementById('ollama_model').value.trim(),
+        count: 5,
+      }),
+    });
+    if (!res.ok) throw new Error(await res.text() || res.statusText);
+    const d = await res.json();
+    renderTitleOptions(d.titles || []);
+  } catch (err) {
+    titleOptionsEl.innerHTML = '<div class="suggestion" style="cursor:default;color:var(--err)">'
+      + String(err.message).slice(0, 300) + '</div>';
+  } finally {
+    titleSuggestBtn.disabled = false;
+    titleSuggestBtn.textContent = '✨ Suggest titles';
+  }
+});
+
+function renderTitleOptions(titles) {
+  titleOptionsEl.innerHTML = '';
+  if (!titles.length) {
+    titleOptionsEl.innerHTML = '<div class="suggestion" style="cursor:default">No titles suggested.</div>';
+    return;
+  }
+  for (const t of titles) {
+    const card = document.createElement('div');
+    card.className = 'suggestion';
+    card.innerHTML = `<div class="s-head"><span>${t.title}</span>`
+      + `<span class="s-range">${(t.title || '').length} ch</span></div>`
+      + (t.angle ? `<div class="s-reason">${t.angle}</div>` : '');
+    card.title = 'Click to use this title';
+    card.onclick = () => {
+      document.getElementById('thumb-title').value = t.title;
+      [...titleOptionsEl.children].forEach(c => c.classList.remove('added'));
+      card.classList.add('added');
+    };
+    titleOptionsEl.appendChild(card);
+  }
+}
+
+// ── Thumbnail enhancement (preset + optional per-knob overrides) ────────────
+const ENHANCE_KNOBS = ['brightness', 'contrast', 'saturation', 'sharpness'];
+const enhanceSel = document.getElementById('thumb-enhance');
+let enhancePresets = {};   // filled from /enhance-presets
+let enhanceTouched = false; // has the user moved a slider off the preset?
+
+function applyPresetToSliders() {
+  const p = enhancePresets[enhanceSel.value];
+  if (!p) return;
+  for (const k of ENHANCE_KNOBS) {
+    const el = document.getElementById('thumb-' + k);
+    el.value = p[k];
+    document.getElementById('thumb-' + k + '-val').textContent = Number(p[k]).toFixed(2);
+  }
+  enhanceTouched = false;
+}
+
+fetch(BASE_PATH + '/enhance-presets').then(r => r.json()).then(d => {
+  enhancePresets = d.presets || {};
+  if (d.default) enhanceSel.value = d.default;
+  applyPresetToSliders();
+}).catch(() => {});
+
+enhanceSel.addEventListener('change', applyPresetToSliders);
+for (const k of ENHANCE_KNOBS) {
+  document.getElementById('thumb-' + k).addEventListener('input', (e) => {
+    document.getElementById('thumb-' + k + '-val').textContent = Number(e.target.value).toFixed(2);
+    enhanceTouched = true;
+  });
+}
+document.getElementById('thumb-enhance-reset').addEventListener('click', applyPresetToSliders);
+
+// Send the raw knob values only once the user has actually moved one — an
+// untouched panel means "just use the preset", and echoing the preset's own
+// numbers back as overrides would freeze the thumbnail on stale values if the
+// preset table ever changes.
+function enhancePayload() {
+  const out = {enhance: enhanceSel.value};
+  if (enhanceTouched) {
+    for (const k of ENHANCE_KNOBS) {
+      out[k] = parseFloat(document.getElementById('thumb-' + k).value);
+    }
+  }
+  return out;
+}
 
 function parseTs(s) {
   const p = String(s || '').trim().split(':').map(Number);
@@ -1477,6 +1843,7 @@ async function grabThumbnail() {
         movie: document.getElementById('thumb-movie').value.trim(),
         font: document.getElementById('thumb-font').value,
         color: document.getElementById('thumb-color').value,
+        ...enhancePayload(),
       }),
     });
     if (!res.ok) throw new Error(await res.text() || res.statusText);
@@ -1502,12 +1869,15 @@ function buildPayload(ranges, usePrepared) {
     video: document.getElementById('video').value.trim(),
     ranges,
     source_title: document.getElementById('source_title').value.trim(),
+    // Blank = let the LLM write it during the metadata step, as before.
+    title: document.getElementById('thumb-title').value.trim(),
     whisper_model: document.getElementById('whisper_model').value,
     ollama_model: document.getElementById('ollama_model').value.trim(),
     watermark: document.getElementById('watermark').value,
     bg_mode: bgMode.value,
     bg_music: bgFileSel.value,
     bg_volume: parseFloat(bgVolume.value),
+    bg_skip: parseFloat(document.getElementById('bg_skip').value) || 0,
     size: parseInt(document.getElementById('size').value, 10),
     language: document.getElementById('language').value.trim(),
     narrate: narrateChk.checked,
@@ -1517,15 +1887,33 @@ function buildPayload(ranges, usePrepared) {
     no_srt: !useSrtChk.checked,
     use_prepared: !!usePrepared,
     prepared_dir: usePrepared ? preparedDir : null,
+    prepared_ranges: usePrepared ? preparedRanges : null,
     remove_silence: document.getElementById('remove_silence').checked,
+    mirror: document.getElementById('mirror').checked,
+    square: document.getElementById('square').checked,
+    caption_font: document.getElementById('caption_font').value,
+    caption_animation: document.getElementById('caption_animation').value,
+    caption_shuffle: document.getElementById('caption_shuffle').checked,
+    caption_color: document.getElementById('caption_color').value,
   };
 }
 
-// Narrated runs are two-phase: cut first so you can pick a thumbnail, then render.
+// Show the fixed-colour picker only when colour shuffle is off.
+(function () {
+  const chk = document.getElementById('caption_shuffle');
+  const wrap = document.getElementById('caption_color_wrap');
+  if (chk && wrap) {
+    const sync = () => { wrap.style.display = chk.checked ? 'none' : 'block'; };
+    chk.addEventListener('change', sync);
+    sync();
+  }
+})();
+
+// Every run is two-phase now: cut first so you can pick a thumbnail + title,
+// then render. (The narrate checkbox only controls narration, not the flow.)
 function submitLabel() {
-  submitBtn.textContent = narrateChk.checked ? '① Cut clip & pick thumbnail' : 'Generate Clip';
+  submitBtn.textContent = '① Cut clip & pick thumbnail';
 }
-narrateChk.addEventListener('change', submitLabel);
 submitLabel();
 
 form.addEventListener('submit', async (e) => {
@@ -1537,11 +1925,7 @@ form.addEventListener('submit', async (e) => {
     errorBox.textContent = 'Add at least one valid range.';
     return;
   }
-  if (narrateChk.checked) {
-    await doPrepare(ranges);
-  } else {
-    await doRun(ranges, false);
-  }
+  await doPrepare(ranges);
 });
 
 function resetRunUi() {
@@ -1569,6 +1953,7 @@ async function doPrepare(ranges) {
   resetRunUi();
   rawClipUrl = null;
   preparedDir = null;
+  preparedRanges = null;
   thumbGrabbed = false;
   submitBtn.disabled = true;
   submitBtn.textContent = 'Cutting clip…';
@@ -1587,10 +1972,12 @@ async function doPrepare(ranges) {
     // Reveal the thumbnail picker loaded with the freshly-cut raw clip.
     rawClipUrl = d.raw_clip_url;
     preparedDir = d.clip_dir || null;
+    preparedRanges = d.prepared_ranges || ranges;
     resultEl.style.display = 'block';
     document.getElementById('result-title').textContent = 'Pick your thumbnail, then render';
     thumbVideo.src = rawClipUrl;
     document.getElementById('thumb-title').value = '';
+    titleOptionsEl.innerHTML = '';   // options belong to the previous cut
     document.getElementById('thumb-movie').value = d.movie || '';
     document.getElementById('thumb-editor').style.display = 'block';
     document.getElementById('thumb-render').style.display = 'block';
@@ -1624,6 +2011,10 @@ async function doRun(ranges, usePrepared) {
       body: JSON.stringify(payload),
     });
     if (!res.ok) throw new Error(await res.text() || res.statusText);
+    // Draw the correct number of segments up front — waiting for the first
+    // '[n/N]' log line meant the bar showed a stale guess until then.
+    const d = await res.json();
+    buildSteps(d.total_steps);
   } catch (err) {
     submitBtn.disabled = false;
     submitLabel();

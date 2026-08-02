@@ -115,14 +115,19 @@ def append_still_image(
     os.close(fd)
     tmp_out = Path(tmp_name)
 
-    # Both inputs are 9:16; normalise fps/sar/format/audio so concat can join them.
-    # Order is video-then-still so the thumbnail lands at the end.
+    # Order is video-then-still so the thumbnail lands at the end. width/height
+    # come from the final video, so the base frame [0:v] is already that size.
+    # The thumbnail is composed at 9:16, so for a SQUARE (classic) video it must
+    # be fit-and-padded, not stretched — otherwise the baked end-frame shows a
+    # vertically-squished poster. force_original_aspect_ratio=decrease + pad
+    # letterboxes it; on a 9:16 video the thumb already matches, so pad is a no-op.
     # Audio stays at the pipeline's native 48kHz (a 44.1k resample here added a
     # pointless extra degradation), and this is the mix's THIRD aac generation
     # — the default 128k bitrate audibly smears at that depth, hence -b:a 192k.
     filter_complex = (
         f"[0:v]scale={width}:{height},setsar=1,fps=30,format=yuv420p[bv];"
-        f"[1:v]scale={width}:{height},setsar=1,fps=30,format=yuv420p[tv];"
+        f"[1:v]scale={width}:{height}:force_original_aspect_ratio=decrease,"
+        f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:black,setsar=1,fps=30,format=yuv420p[tv];"
         f"[0:a]aformat=sample_rates=48000:channel_layouts=stereo[ba];"
         f"[2:a]aformat=sample_rates=48000:channel_layouts=stereo[sa];"
         f"[bv][ba][tv][sa]concat=n=2:v=1:a=1[v][a]"

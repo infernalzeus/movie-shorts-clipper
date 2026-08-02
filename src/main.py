@@ -42,12 +42,20 @@ AUDIO_DIR   = PROJECT_ROOT / "audio"
 
 _JUNK_TOKENS = re.compile(
     r"\b("
-    r"1080p|720p|2160p|4k|uhd|hdr|webrip|web-dl|webdl|bluray|blu-ray|brrip|dvdrip|"
-    r"hdtv|x264|x265|h264|h265|hevc|aac\d?|ac3|dts|yts|yify|rarbg|amzn|nf|repack|"
-    r"proper|extended|remastered|directors cut|multi|dual audio"
+    r"1080p|720p|480p|2160p|4k|uhd|imax|"
+    r"hdr10\+?|hdr|dolby ?vision|dovi|"
+    r"webrip|web[-\s]?dl|webdl|bluray|blu[-\s]?ray|bdrip|brrip|dvdrip|hdtv|remux|"
+    r"x264|x265|h ?264|h ?265|hevc|10bit|8bit|"
+    # Audio codecs, optionally swallowing a glued channel count (AAC5.1 / DDP5.1
+    # arrive here as "aac5 1" after dots became spaces).
+    r"(?:aac\d?|ac3|eac3|ddp?\+?\d?|dts(?:[-\s]?hd)?(?:[-\s]?ma)?|truehd)(?:\s[012])?|atmos|"
+    r"yts|yify|rarbg|amzn|nf|repack|proper|extended|remastered|directors cut|"
+    r"multi|dual audio"
     r")\b",
     re.IGNORECASE,
 )
+# Audio channel layouts (5.1, 7.1, 2.0) — stripped before dots become spaces.
+_CHANNELS_RE = re.compile(r"\b[257][.\s][012]\b")
 _YEAR_RE = re.compile(r"\b(19|20)\d{2}\b")
 
 
@@ -61,6 +69,7 @@ def filename_to_title(path: Path) -> str:
     stem = path.stem
     stem = re.sub(r"-[A-Z0-9]{2,}$", "", stem)  # trailing release-group tag, e.g. "-RARBG"
     stem = re.sub(r"[\[\(\{].*?[\]\)\}]", " ", stem)
+    stem = _CHANNELS_RE.sub(" ", stem)  # 5.1 / 7.1 / 2.0 before dots turn to spaces
     stem = stem.replace(".", " ").replace("_", " ").replace("-", " ")
     stem = _JUNK_TOKENS.sub(" ", stem)
     stem = _YEAR_RE.sub(" ", stem)
@@ -86,6 +95,21 @@ def prompt_ranges() -> list[tuple[float, float]]:
             print(f"  {exc}")
 
 
+def _prepare_fingerprint(video_path: Path, ranges: list) -> dict:
+    """Identify what a prepared clip_raw.mp4 was actually cut from.
+
+    Written to prepare.json at --prepare-only time and re-checked before any
+    --clip-dir reuse. Without this, changing the ranges and re-rendering from
+    the same prepared dir silently keeps the OLD cut while the new ranges flow
+    on to the caption/narration steps — you get one clip's video carrying
+    another clip's dialogue.
+    """
+    return {
+        "video": str(Path(video_path).resolve()),
+        "ranges": [[round(float(s), 3), round(float(e), 3)] for s, e in ranges],
+    }
+
+
 class StepPrinter:
     """Prints '[n/N] ...' progress lines (the web UI parses these)."""
 
@@ -95,7 +119,11 @@ class StepPrinter:
 
     def __call__(self, message: str) -> None:
         self.n += 1
-        print(f"\n[{self.n}/{self.total}] {message}" if self.n == 1 else f"[{self.n}/{self.total}] {message}")
+        # flush: stdout is a pipe when the web UI spawns us, and Python
+        # block-buffers pipes — without this the progress lines arrive in one
+        # burst at the end instead of as each step completes.
+        print(f"\n[{self.n}/{self.total}] {message}" if self.n == 1 else f"[{self.n}/{self.total}] {message}",
+              flush=True)
 
 
 def main() -> None:
@@ -106,9 +134,13 @@ def main() -> None:
     parser.add_argument("--language", default="en", help="Transcription language code (default: en)")
     parser.add_argument("--ollama-model", default=DEFAULT_MODEL, help=f"Ollama model for metadata (default: {DEFAULT_MODEL})")
     parser.add_argument("--source-title", help="Movie/show name override (default: parsed from the filename)")
+    parser.add_argument("--title", default=None,
+                        help="On-screen title override (default: written by the LLM in the metadata step)")
     parser.add_argument("--size", type=int, default=1080, help="Square-mode side length in pixels (default: 1080)")
     parser.add_argument("--bg-music", default=None, help="Path to background music file (default: random from audio/)")
     parser.add_argument("--bg-volume", type=float, default=0.10, help="Background music volume 0.0–1.0 (default: 0.10)")
+    parser.add_argument("--bg-skip", type=float, default=0.0,
+                        help="Skip the first N seconds of the background music (e.g. cut a slow intro). Default: 0")
     parser.add_argument("--no-bg-music", action="store_true", help="Disable background music entirely")
     parser.add_argument(
         "--watermark",
@@ -137,6 +169,16 @@ def main() -> None:
                         help="Bake the thumbnail as the last 0.1s of the final video (pick it as the Short's thumbnail on mobile)")
     parser.add_argument("--remove-silence", action="store_true",
                         help="Cut sections where the audio is near-silent (no dialogue) before rendering (default: off)")
+    parser.add_argument("--caption-font", default="Arial Black",
+                        help="Caption font family (must be installed on the system; default: Arial Black)")
+    parser.add_argument("--caption-animation", choices=["karaoke", "fade", "pop"], default="karaoke",
+                        help="Caption effect: karaoke (word-by-word), fade (whole line), pop (scale-in)")
+    parser.add_argument("--caption-color", default="white",
+                        help="Fixed caption colour when shuffle is off (white/yellow/green/cyan/pink/orange)")
+    parser.add_argument("--no-caption-shuffle", action="store_true",
+                        help="Use one fixed --caption-color instead of cycling colours per sentence")
+    parser.add_argument("--mirror", action="store_true",
+                        help="Mirror (flip left-right) the clip footage only — captions/narration text stay upright")
     args = parser.parse_args()
 
     video_arg = args.video.strip().strip('"').strip("'") if args.video else None
@@ -197,6 +239,8 @@ def main() -> None:
     if args.prepare_only:
         print("\n[prepare] Cutting raw clip...")
         cut_and_concat(video_path, ranges, raw_clip_path)
+        (clip_dir / "prepare.json").write_text(
+            json.dumps(_prepare_fingerprint(video_path, ranges), indent=2), encoding="utf-8")
         print("\nPrepared.")
         print(f"  Clip dir:     {clip_dir}")
         print(f"  Raw clip:     {raw_clip_path}")
@@ -205,11 +249,40 @@ def main() -> None:
 
     # 5 base steps: cut, captions, metadata, build-ass, burn. Framing (square /
     # vertical canvas) is folded into the burn encode, not a step of its own.
-    total_steps = (5 + (3 if args.narrate else 0) + (1 if args.prepend_thumbnail else 0)
-                   + (1 if args.remove_silence else 0))
+    # A thumbnail is composed whenever the narrated format needs one OR it's
+    # being baked into the video (--prepend-thumbnail), so every pick-first run —
+    # classic included — accounts for the compose + bake steps.
+    want_thumbnail = args.narrate or args.prepend_thumbnail
+    total_steps = (5
+                   + (1 if args.remove_silence else 0)
+                   + (2 if args.narrate else 0)            # narration beats + voiceover
+                   + (1 if want_thumbnail else 0)          # compose/use thumbnail
+                   + (1 if args.prepend_thumbnail else 0)) # bake thumbnail into video
     step = StepPrinter(total_steps)
 
+    # Only reuse a prepared cut when it was cut from THIS video and THESE
+    # ranges — otherwise re-cut. A stale reuse renders the old clip's video
+    # while the new ranges drive captions/narration, so the dialogue belongs to
+    # a different clip entirely.
+    reuse_ok = False
     if raw_clip_path.is_file() and args.clip_dir:
+        want = _prepare_fingerprint(video_path, ranges)
+        try:
+            have = json.loads((clip_dir / "prepare.json").read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            have = None
+        reuse_ok = have == want
+        if not reuse_ok:
+            why = "cut from different ranges/video" if have else "no prepare.json (cut by an older version)"
+            print(f"  ! Prepared clip does not match this request ({why}) — re-cutting.")
+            # Any hand-picked thumbnail in this dir was picked off the OLD cut,
+            # so it shows a frame that isn't in the new clip. Drop it and let
+            # the thumbnail step compose a fresh one.
+            if thumbnail_path.is_file():
+                thumbnail_path.unlink()
+                print("  ! Discarded the thumbnail picked from the old cut.")
+
+    if reuse_ok:
         step(f"Reusing prepared raw clip ({raw_clip_path.name})...")
         print(f"      -> {raw_clip_path}")
     else:
@@ -303,6 +376,11 @@ def main() -> None:
 
     step(f"Fetching movie context + generating metadata via Ollama ({args.ollama_model})...")
     meta = generate_metadata(transcript, source_title=source_title, model=args.ollama_model)
+    # A title chosen in the web UI wins over the one the LLM just wrote — the
+    # description and tags from this call are still used as-is.
+    if args.title:
+        meta["title"] = args.title
+        print(f"      -> title override: {args.title!r}")
     metadata_path.write_text(json.dumps(meta, indent=2), encoding="utf-8")
     description_path.write_text(
         f"{meta['title']}\n\n{meta['description']}",
@@ -318,6 +396,10 @@ def main() -> None:
         title=meta["title"],
         narration=narration_segments,
         layout=layout,
+        caption_font=args.caption_font,
+        caption_animation=args.caption_animation,
+        caption_shuffle=not args.no_caption_shuffle,
+        caption_color=args.caption_color,
     )
     print(f"      -> {ass_path}")
 
@@ -346,15 +428,16 @@ def main() -> None:
 
     burn_subtitles(
         framing_src, ass_path, final_path,
-        bg_music=bg_music_path, bg_volume=args.bg_volume,
+        bg_music=bg_music_path, bg_volume=args.bg_volume, bg_skip=args.bg_skip,
         watermark=watermark_text,
         narration_audio=narration_wav if narration_segments else None,
         narration_volume=args.narration_volume,
         pre_filter=pre_filter,
+        mirror=args.mirror,
     )
     print(f"      -> {final_path}")
 
-    if args.narrate:
+    if want_thumbnail:
         if thumbnail_path.is_file() and args.clip_dir:
             # A thumbnail was hand-picked in the web UI's phase-1 step — keep it.
             step("Using hand-picked thumbnail...")
@@ -380,6 +463,7 @@ def main() -> None:
     print(f"  Raw clip:     {raw_clip_path}")
     if args.narrate:
         print(f"  Narration:    {narration_txt}")
+    if want_thumbnail and thumbnail_path.is_file():
         print(f"  Thumbnail:    {thumbnail_path}")
 
 

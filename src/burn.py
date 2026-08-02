@@ -47,10 +47,12 @@ def burn_subtitles(
     output_path: Path,
     bg_music: Path | None = None,
     bg_volume: float = 0.10,
+    bg_skip: float = 0.0,
     watermark: str | None = None,
     narration_audio: Path | None = None,
     narration_volume: float = 0.04,
     pre_filter: str | None = None,
+    mirror: bool = False,
 ) -> Path:
     """Burn the .ass captions into the video and mix the audio layers:
     movie audio (full, unchanged) + narration voiceover at narration_volume,
@@ -62,12 +64,25 @@ def burn_subtitles(
     output_path.parent.mkdir(parents=True, exist_ok=True)
     ass_arg = _escape_filter_path(ass_path)
 
-    vf_parts = [pre_filter] if pre_filter else []
+    # hflip goes FIRST so only the footage is mirrored — the ass captions and the
+    # watermark are added afterwards, so text stays the right way round.
+    vf_parts = ["hflip"] if mirror else []
+    if pre_filter:
+        vf_parts.append(pre_filter)
     vf_parts.append(f"ass='{ass_arg}'")
     if watermark:
         vf_parts.append(_watermark_filter(watermark))
     vf = ",".join(vf_parts)
     print(f"      [vf] {vf}")
+
+    # Optionally drop the first bg_skip seconds of the background track (skip a
+    # long intro / silent lead-in) before it's looped to fill the clip. Reset the
+    # timestamps after the trim so aloop and the clip-length atrim below both
+    # start from zero.
+    bg_pre = (f"atrim=start={bg_skip},asetpts=PTS-STARTPTS,"
+              if bg_music and bg_skip and bg_skip > 0 else "")
+    if bg_pre:
+        print(f"      -> skipping first {bg_skip:g}s of background music")
 
     try:
         if narration_audio:
@@ -95,7 +110,7 @@ def burn_subtitles(
             if bg_music:
                 inputs += ["-i", str(bg_music)]
                 chains.append(
-                    f"[2:a]aloop=loop=-1:size=2000000000,atrim=0:{dur},volume={bg_volume},{norm}[bg]"
+                    f"[2:a]{bg_pre}aloop=loop=-1:size=2000000000,atrim=0:{dur},volume={bg_volume},{norm}[bg]"
                 )
                 mix_labels += "[bg]"
                 n_mix = 3
@@ -118,11 +133,16 @@ def burn_subtitles(
             dur = _get_duration(video_path)
             # Same stereo/48k normalization as the narrated branch (see above).
             norm = "aresample=48000,aformat=channel_layouts=stereo"
+            # normalize=0 SUMS the inputs instead of auto-rescaling by the
+            # active-input count: the movie stays at its full level and the bg
+            # music sits at exactly bg_volume. The old default (normalize=1 with
+            # dropout_transition=2) renormalised over the first 2s, which made the
+            # music audibly swell up from quiet to full as the clip began.
             filter_complex = (
                 f"[0:a]{norm}[a0];"
-                f"[1:a]aloop=loop=-1:size=2000000000,atrim=0:{dur},"
+                f"[1:a]{bg_pre}aloop=loop=-1:size=2000000000,atrim=0:{dur},"
                 f"volume={bg_volume},{norm}[bg];"
-                f"[a0][bg]amix=inputs=2:duration=first:dropout_transition=2[aout]"
+                f"[a0][bg]amix=inputs=2:duration=first:normalize=0[aout]"
             )
             _run_ffmpeg([
                 "ffmpeg", "-y",
