@@ -42,6 +42,7 @@ _AUDIO_EXTS = {".mp3", ".wav", ".ogg", ".aac", ".flac", ".m4a"}
 STEP_RE = re.compile(r"^\[(\d+)/(\d+)\]\s*(.*)$")
 
 SCENES_SCRIPT = SRC_DIR / "scenes.py"
+RECAP_SCRIPT = SRC_DIR / "recap.py"
 THUMBNAIL_SCRIPT = SRC_DIR / "thumbnail.py"
 METADATA_SCRIPT = SRC_DIR / "metadata.py"
 
@@ -419,6 +420,53 @@ async def suggest_scenes(request: web.Request) -> web.Response:
     return web.json_response(payload)
 
 
+_recap_lock = asyncio.Lock()
+
+
+@routes.post("/build-recap")
+async def build_recap(request: web.Request) -> web.Response:
+    """Run src/recap.py against the movie's SRT and return an ordered chain of
+    plot-recap beats (with a ready-to-use combined ranges string)."""
+    data = await request.json()
+    srt = (data.get("srt") or "").strip()
+    if not srt or not Path(srt).is_file():
+        raise web.HTTPBadRequest(text="SRT file not found")
+
+    args = [sys.executable, str(RECAP_SCRIPT), "--srt", srt, "--json"]
+    if data.get("title"):
+        args += ["--title", str(data["title"])]
+    if data.get("model"):
+        args += ["--model", str(data["model"])]
+    if data.get("target_seconds"):
+        args += ["--target-seconds", str(data["target_seconds"])]
+
+    if _recap_lock.locked():
+        raise web.HTTPConflict(text="A recap build is already running")
+    ollama_err = await _ensure_ollama()
+    if ollama_err:
+        raise web.HTTPServiceUnavailable(text=ollama_err)
+    async with _recap_lock:
+        env = os.environ.copy()
+        env["PYTHONIOENCODING"] = "utf-8"
+        proc = await asyncio.create_subprocess_exec(
+            *args,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            cwd=str(SRC_DIR),
+            env=env,
+        )
+        stdout, stderr = await proc.communicate()
+
+    if proc.returncode != 0:
+        detail = (stderr or stdout or b"").decode(errors="replace")[-800:]
+        raise web.HTTPInternalServerError(text=f"recap build failed:\n{detail}")
+    try:
+        payload = json.loads(stdout.decode(errors="replace").strip().splitlines()[-1])
+    except (json.JSONDecodeError, IndexError):
+        raise web.HTTPInternalServerError(text="recap build returned unparseable output")
+    return web.json_response(payload)
+
+
 _titles_lock = asyncio.Lock()
 
 
@@ -725,10 +773,12 @@ def _expected_steps(args: list[str]) -> int:
     passed, so the UI draws the right number of segments from the first paint
     instead of jumping when the real total arrives on the '[1/N]' line.
     """
+    is_recap = "--mode" in args and "recap" in args
     return (5
-            + (1 if "--remove-silence" in args else 0)
+            + (2 if is_recap else 0)                            # recap: analysis + animated outro
+            + (1 if ("--remove-silence" in args and not is_recap) else 0)
             + (2 if "--narrate" in args else 0)                 # narration beats + voiceover
-            + (1 if ("--narrate" in args or "--prepend-thumbnail" in args) else 0)  # compose/use thumbnail
+            + (1 if ("--narrate" in args or "--prepend-thumbnail" in args or is_recap) else 0)  # thumbnail
             + (1 if "--prepend-thumbnail" in args else 0))      # bake thumbnail into video
 
 
@@ -741,12 +791,17 @@ async def start_run(request: web.Request) -> web.Response:
 
     video = _clean_path(data.get("video"))
     ranges = (data.get("ranges") or "").strip()
+    mode = data.get("mode") or ("narrated" if data.get("narrate") else "classic")
     if not video or not Path(video).is_file():
         raise web.HTTPBadRequest(text="Video file not found")
-    if not ranges:
+    # Recap can auto-build its ranges from the whole subtitle file, so it may
+    # legitimately arrive with none; every other mode needs at least one.
+    if not ranges and mode != "recap":
         raise web.HTTPBadRequest(text="At least one range is required")
 
-    args = ["--video", video, "--ranges", ranges]
+    args = ["--video", video]
+    if ranges:
+        args += ["--ranges", ranges]
 
     if data.get("source_title"):
         args += ["--source-title", str(data["source_title"])]
@@ -762,12 +817,32 @@ async def start_run(request: web.Request) -> web.Response:
     watermark = data.get("watermark") or "mv-edits"
     args += ["--watermark", watermark]
 
-    if data.get("narrate"):
+    if mode == "narrated":
         args += ["--narrate"]
         if data.get("narration_volume") is not None:
             args += ["--narration-volume", str(data["narration_volume"])]
         if data.get("tts_voice"):
             args += ["--tts-voice", str(data["tts_voice"])]
+    elif mode == "recap":
+        # Recap montage: main.py needs the SRT (beats + captions) and the music
+        # (bg-music, supplied by the Background-music block below). The outro
+        # face-scan + beat-sync all run inside main.py.
+        args += ["--mode", "recap"]
+        if data.get("target_seconds") is not None:
+            args += ["--target-seconds", str(data["target_seconds"])]
+        if (data.get("recap_model") or "").strip():
+            args += ["--recap-model", str(data["recap_model"]).strip()]
+        if data.get("no_outro"):
+            args += ["--no-outro"]
+        if data.get("outro_seconds") is not None:
+            args += ["--outro-seconds", str(data["outro_seconds"])]
+        if data.get("auto_outro_shots") is not None:
+            try:
+                args += ["--auto-outro-shots", str(int(data["auto_outro_shots"]))]
+            except (TypeError, ValueError):
+                pass
+        if (data.get("outro_shots") or "").strip():
+            args += ["--outro-shots", str(data["outro_shots"]).strip()]
 
     # Two-phase applies to EVERY run now (narrated or classic): reuse the
     # prepared cut + hand-picked thumbnail, and bake the thumbnail into the video
@@ -802,7 +877,7 @@ async def start_run(request: web.Request) -> web.Response:
     # Output shape: 9:16 vertical by default; the Square checkbox forces 1:1.
     # Narration needs the vertical band beneath the video, so a narrated edit is
     # always vertical regardless of the checkbox.
-    layout = "square" if (data.get("square") and not data.get("narrate")) else "vertical"
+    layout = "square" if (data.get("square") and mode != "narrated") else "vertical"
     args += ["--layout", layout]
     if data.get("remove_silence"):
         args += ["--remove-silence"]
@@ -836,6 +911,19 @@ async def start_run(request: web.Request) -> web.Response:
                 args += ["--bg-skip", str(data["bg_skip"])]
         except (TypeError, ValueError):
             pass
+
+    # Edit-style description credits. Recap defaults to it in main.py, so an
+    # unchecked box must explicitly opt out (--no-edit-credits) to override that.
+    if data.get("edit_credits"):
+        args += ["--edit-credits"]
+        if (data.get("music_credit") or "").strip():
+            args += ["--music-credit", str(data["music_credit"]).strip()]
+        if (data.get("editing_program") or "").strip():
+            args += ["--editing-program", str(data["editing_program"]).strip()]
+        if data.get("no_disclaimer"):
+            args += ["--no-disclaimer"]
+    else:
+        args += ["--no-edit-credits"]
 
     ollama_err = await _ensure_ollama()
     if ollama_err:
@@ -1082,6 +1170,16 @@ summary{font-size:12px;color:var(--text-muted);cursor:pointer;padding:4px 0}
 
 <form id="form">
   <fieldset>
+    <legend>Format</legend>
+    <label for="format">Output format</label>
+    <select id="format">
+      <option value="narrated" selected>Narrated — TTS voiceover + text band (monetization-friendly)</option>
+      <option value="classic">Classic — square crop, karaoke captions</option>
+      <option value="recap">Recap Montage — beat-synced plot recap + iconic outro</option>
+    </select>
+  </fieldset>
+
+  <fieldset>
     <legend>Source</legend>
     <label for="video">Movie file path</label>
     <div class="range-row">
@@ -1112,7 +1210,7 @@ summary{font-size:12px;color:var(--text-muted);cursor:pointer;padding:4px 0}
     <input type="text" id="source_title" placeholder="Auto-parsed from filename if left blank">
   </fieldset>
 
-  <fieldset>
+  <fieldset id="narrate-fieldset">
     <legend>Narration</legend>
     <label style="display:flex;align-items:center;gap:8px;margin:0;cursor:pointer">
       <input type="checkbox" id="narrate" checked style="accent-color:var(--accent)">
@@ -1130,6 +1228,35 @@ summary{font-size:12px;color:var(--text-muted);cursor:pointer;padding:4px 0}
       </select>
       <label for="narration_volume">Voiceover volume <span id="nvolume-val">0.04</span></label>
       <input type="range" id="narration_volume" min="0" max="1" step="0.01" value="0.04">
+    </div>
+  </fieldset>
+
+  <fieldset id="recap-fieldset" style="display:none">
+    <legend>Recap Montage</legend>
+    <p style="color:var(--text-faint);font-size:13px;margin:0 0 10px">
+      Needs a subtitle file (drives the beat picks + captions) and a hand-picked music
+      track under <em>Background music</em> below (the whole edit is cut to its beats).
+      Dialogue is ducked under a loud music bed — no narration.
+      <br><strong>Leave the clip ranges empty</strong> to auto-build the recap from the whole
+      movie, or click below to preview and tweak the beats first.
+    </p>
+    <button type="button" id="recap-build-btn" class="mini-btn">🎬 Build recap from subtitles (optional preview)</button>
+    <div id="recap-build-status" style="color:var(--text-faint);font-size:13px;margin-top:6px"></div>
+
+    <label for="recap_target" style="margin-top:12px">Target length <span id="recap-target-val">120</span>s</label>
+    <input type="range" id="recap_target" min="30" max="180" step="10" value="120">
+
+    <label style="display:flex;align-items:center;gap:8px;cursor:pointer;margin-top:12px">
+      <input type="checkbox" id="recap_outro" checked style="accent-color:var(--accent)">
+      <span>Beat-synced iconic outro — rapid face-shot montage on the final seconds</span>
+    </label>
+    <div id="recap-outro-opts">
+      <label for="outro_seconds">Outro length <span id="outro-sec-val">5</span>s</label>
+      <input type="range" id="outro_seconds" min="2" max="12" step="1" value="5">
+      <label for="auto_outro_shots" style="margin-top:12px">Auto-find this many iconic face shots (0 = off, scans at render)</label>
+      <input type="number" id="auto_outro_shots" min="0" max="30" step="1" value="12">
+      <label for="outro_shots_manual" style="margin-top:12px">Extra iconic timestamps (optional, comma-separated)</label>
+      <input type="text" id="outro_shots_manual" placeholder="1:02:10, 1:15:03">
     </div>
   </fieldset>
 
@@ -1222,6 +1349,24 @@ summary{font-size:12px;color:var(--text-muted);cursor:pointer;padding:4px 0}
       <input type="range" id="bg_volume" min="0" max="1" step="0.01" value="0.10">
       <label for="bg_skip">Skip first N seconds of the track (cut a slow intro)</label>
       <input type="number" id="bg_skip" min="0" step="0.5" value="0" placeholder="0">
+    </div>
+  </fieldset>
+
+  <fieldset>
+    <legend>Description &amp; credits</legend>
+    <label style="display:flex;align-items:center;gap:8px;margin:0;cursor:pointer">
+      <input type="checkbox" id="edit_credits" style="accent-color:var(--accent)">
+      <span>Edit-style description — Movie / Music / Editing credits + hashtags + fair-use disclaimer</span>
+    </label>
+    <div id="edit-credits-opts" style="display:none">
+      <label for="music_credit" style="margin-top:12px">Music credit (the “Music:” line)</label>
+      <input type="text" id="music_credit" placeholder="Artist – Track (auto-filled from the music file)">
+      <label for="editing_program" style="margin-top:12px">Editing program (the “Editing Program:” line)</label>
+      <input type="text" id="editing_program" value="Adobe After Effects 2024">
+      <label style="display:flex;align-items:center;gap:8px;cursor:pointer;margin-top:12px">
+        <input type="checkbox" id="edit_disclaimer" checked style="accent-color:var(--accent)">
+        <span>Include the © fair-use copyright disclaimer</span>
+      </label>
     </div>
   </fieldset>
 
@@ -1361,6 +1506,9 @@ const narrateChk = document.getElementById('narrate');
 const narrateOpts = document.getElementById('narrate-opts');
 const nVolume    = document.getElementById('narration_volume');
 const nVolumeVal = document.getElementById('nvolume-val');
+const formatSel  = document.getElementById('format');
+const recapFieldset = document.getElementById('recap-fieldset');
+const narrateFieldset = document.getElementById('narrate-fieldset');
 
 let probedSrt = null;
 // Real total comes from /run (and is confirmed by the first '[n/N]' log line).
@@ -1396,6 +1544,105 @@ bgVolume.addEventListener('input', () => { volumeVal.textContent = bgVolume.valu
 nVolume.addEventListener('input', () => { nVolumeVal.textContent = nVolume.value; });
 narrateChk.addEventListener('change', () => {
   narrateOpts.style.display = narrateChk.checked ? 'block' : 'none';
+});
+
+// ── Format selector: show/hide + require the right widgets per mode ──────────
+function syncFormat() {
+  const f = formatSel.value;
+  narrateFieldset.style.display = f === 'narrated' ? 'block' : 'none';
+  recapFieldset.style.display = f === 'recap' ? 'block' : 'none';
+  // The narrate checkbox is the legacy switch main.py still reads — keep it in
+  // sync with the selector so the payload is unambiguous.
+  narrateChk.checked = (f === 'narrated');
+  narrateOpts.style.display = (f === 'narrated') ? 'block' : 'none';
+  // Recap is cut to one hand-picked track — force "Specific file" mode.
+  if (f === 'recap' && bgMode.value !== 'file') { bgMode.value = 'file'; syncBgMode(); }
+  // Edit-style description is the default for recap edits.
+  if (f === 'recap') { editCreditsChk.checked = true; syncEditCredits(); }
+  submitLabel();
+}
+formatSel.addEventListener('change', syncFormat);
+
+// ── Edit-style description credits ──────────────────────────────────────────
+const editCreditsChk = document.getElementById('edit_credits');
+const editCreditsOpts = document.getElementById('edit-credits-opts');
+const musicCreditInput = document.getElementById('music_credit');
+function cleanMusicName(fn) {
+  return (fn || '').replace(/\\.[A-Za-z0-9]+$/, '').replace(/^\\s*\\d+[\\.\\)\\-\\s]+/, '')
+    .replace(/_/g, ' ').replace(/\\s+/g, ' ').trim();
+}
+function syncEditCredits() {
+  editCreditsOpts.style.display = editCreditsChk.checked ? 'block' : 'none';
+  // Prefill the music credit from the chosen track, but never clobber a manual edit.
+  if (editCreditsChk.checked && !musicCreditInput.value.trim() && bgMode.value === 'file' && bgFileSel.value) {
+    musicCreditInput.value = cleanMusicName(bgFileSel.value);
+  }
+}
+editCreditsChk.addEventListener('change', syncEditCredits);
+bgFileSel.addEventListener('change', () => {
+  if (editCreditsChk.checked && !musicCreditInput.value.trim()) {
+    musicCreditInput.value = cleanMusicName(bgFileSel.value);
+  }
+});
+
+// Recap sliders + outro toggle
+const recapTarget = document.getElementById('recap_target');
+const recapTargetVal = document.getElementById('recap-target-val');
+recapTarget.addEventListener('input', () => { recapTargetVal.textContent = recapTarget.value; });
+const outroSec = document.getElementById('outro_seconds');
+const outroSecVal = document.getElementById('outro-sec-val');
+outroSec.addEventListener('input', () => { outroSecVal.textContent = outroSec.value; });
+const recapOutroChk = document.getElementById('recap_outro');
+recapOutroChk.addEventListener('change', () => {
+  document.getElementById('recap-outro-opts').style.display = recapOutroChk.checked ? 'block' : 'none';
+});
+
+// Build the whole recap's ranges from the subtitles in one click.
+document.getElementById('recap-build-btn').addEventListener('click', async () => {
+  const statusEl = document.getElementById('recap-build-status');
+  if (!(useSrtChk.checked && probedSrt)) {
+    statusEl.style.color = 'var(--err)';
+    statusEl.textContent = 'Check subtitles first — recap reads the whole .srt.';
+    return;
+  }
+  const btn = document.getElementById('recap-build-btn');
+  btn.disabled = true;
+  const oldText = btn.textContent;
+  btn.textContent = '⏳ Reading the whole plot… (can take a minute)';
+  statusEl.style.color = 'var(--text-faint)';
+  statusEl.textContent = '';
+  try {
+    const res = await fetch(BASE_PATH + '/build-recap', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({
+        srt: probedSrt,
+        title: document.getElementById('source_title').value.trim(),
+        model: suggestModel.value === '__cloud__'
+          ? document.getElementById('ollama_model').value.trim()
+          : suggestModel.value,
+        target_seconds: parseInt(recapTarget.value, 10),
+      }),
+    });
+    if (!res.ok) throw new Error(await res.text() || res.statusText);
+    const d = await res.json();
+    const beats = d.beats || [];
+    if (!beats.length) { statusEl.textContent = 'No recap beats came back — try a different model.'; return; }
+    // Replace every range row with the recap beats, in order.
+    rangesEl.innerHTML = '';
+    for (const b of beats) {
+      const [s, e] = b.range.split('-');
+      addRangeRow(s, e);
+    }
+    const total = beats.reduce((a, b) => a + (b.end - b.start), 0);
+    statusEl.textContent = `${beats.length} beats loaded (~${Math.round(total)}s). Pick a music track, then build.`;
+  } catch (err) {
+    statusEl.style.color = 'var(--err)';
+    statusEl.textContent = 'Recap build failed: ' + String(err.message).slice(0, 300);
+  } finally {
+    btn.disabled = false;
+    btn.textContent = oldText;
+  }
 });
 
 // ── SRT probe + scene suggestions ──────────────────────────────────────────
@@ -1880,9 +2127,24 @@ function buildPayload(ranges, usePrepared) {
     bg_skip: parseFloat(document.getElementById('bg_skip').value) || 0,
     size: parseInt(document.getElementById('size').value, 10),
     language: document.getElementById('language').value.trim(),
+    mode: formatSel.value,
     narrate: narrateChk.checked,
     narration_volume: parseFloat(nVolume.value),
     tts_voice: document.getElementById('tts_voice').value,
+    // Recap-only options (ignored by the server for other modes).
+    outro_seconds: parseFloat(outroSec.value),
+    no_outro: !recapOutroChk.checked,
+    auto_outro_shots: parseInt(document.getElementById('auto_outro_shots').value, 10) || 0,
+    outro_shots: document.getElementById('outro_shots_manual').value.trim(),
+    target_seconds: parseInt(recapTarget.value, 10),
+    recap_model: suggestModel.value === '__cloud__'
+      ? document.getElementById('ollama_model').value.trim()
+      : suggestModel.value,
+    // Edit-style description credits.
+    edit_credits: editCreditsChk.checked,
+    music_credit: musicCreditInput.value.trim(),
+    editing_program: document.getElementById('editing_program').value.trim(),
+    no_disclaimer: !document.getElementById('edit_disclaimer').checked,
     srt: (useSrtChk.checked && probedSrt) ? probedSrt : null,
     no_srt: !useSrtChk.checked,
     use_prepared: !!usePrepared,
@@ -1912,14 +2174,36 @@ function buildPayload(ranges, usePrepared) {
 // Every run is two-phase now: cut first so you can pick a thumbnail + title,
 // then render. (The narrate checkbox only controls narration, not the flow.)
 function submitLabel() {
-  submitBtn.textContent = '① Cut clip & pick thumbnail';
+  // Recap renders in one phase (auto thumbnail); the other formats cut first so
+  // you can hand-pick a thumbnail.
+  submitBtn.textContent = (formatSel.value === 'recap')
+    ? '🎬 Build recap video' : '① Cut clip & pick thumbnail';
 }
 submitLabel();
+syncFormat();
 
 form.addEventListener('submit', async (e) => {
   e.preventDefault();
   errorBox.style.display = 'none';
   const ranges = collectRanges();
+  // Recap is single-phase and can auto-build its own ranges from the subtitles,
+  // so it may run with none. The outro is cut inside main.py, so the two-phase
+  // prepare can't be reused — render directly.
+  if (formatSel.value === 'recap') {
+    if (!(useSrtChk.checked && probedSrt)) {
+      errorBox.style.display = 'block';
+      errorBox.textContent = 'Recap needs a subtitle file — click “Check subtitles”.';
+      return;
+    }
+    if (bgMode.value !== 'file' || !bgFileSel.value) {
+      errorBox.style.display = 'block';
+      errorBox.textContent = 'Recap needs a hand-picked music track — choose “Specific file” under “Background music” and select one.';
+      return;
+    }
+    // ranges may be '' — main.py builds the recap from the whole subtitle file.
+    await doRun(ranges, false);
+    return;
+  }
   if (!ranges) {
     errorBox.style.display = 'block';
     errorBox.textContent = 'Add at least one valid range.';

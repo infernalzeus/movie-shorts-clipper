@@ -90,20 +90,30 @@ def cut_and_concat(video_path: Path, ranges: list[tuple[float, float]], output_p
             "\n".join(f"file '{p.as_posix()}'" for p in segment_paths),
             encoding="utf-8",
         )
-        try:
-            subprocess.run(
-                [
-                    "ffmpeg", "-y",
-                    "-f", "concat", "-safe", "0",
-                    "-i", str(concat_list),
-                    "-c:v", "libx264", "-c:a", "aac",
-                    str(output_path),
-                ],
-                check=True,
+        # Stream-COPY the concat, don't re-encode. Every segment above was cut
+        # with identical encoder settings and starts on its own keyframe (each
+        # `-ss` forces a fresh IDR), so the concat demuxer joins them cleanly with
+        # `-c copy` — near-instant. Re-encoding here was pathologically slow for
+        # recap mode (20-30+ segments → a multi-minute clip re-encoded at full
+        # source resolution / libx264's slow default), and it's wasted work:
+        # clip_raw.mp4 is an intermediate that burn.py re-encodes again anyway
+        # (framing + captions + audio mix). Fall back to a fast re-encode only if
+        # the copy concat ever fails (e.g. odd codec parameters).
+        concat_cmd = [
+            "ffmpeg", "-y",
+            "-f", "concat", "-safe", "0",
+            "-i", str(concat_list),
+        ]
+        copy = subprocess.run(concat_cmd + ["-c", "copy", str(output_path)],
+                              capture_output=True)
+        if copy.returncode != 0:
+            reencode = subprocess.run(
+                concat_cmd + ["-c:v", "libx264", "-preset", "veryfast", "-crf", "18",
+                              "-c:a", "aac", str(output_path)],
                 capture_output=True,
             )
-        except subprocess.CalledProcessError as e:
-            stderr = e.stderr.decode(errors="replace") if e.stderr else ""
-            raise RuntimeError(f"ffmpeg concat failed:\n{stderr}") from None
+            if reencode.returncode != 0:
+                stderr = reencode.stderr.decode(errors="replace") if reencode.stderr else ""
+                raise RuntimeError(f"ffmpeg concat failed:\n{stderr}") from None
 
     return output_path

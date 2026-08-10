@@ -1,10 +1,14 @@
 """CLI: turn a movie file + chosen timestamp ranges into a captioned YouTube Short with metadata.
 
-Two modes:
+Three modes (--mode, or the legacy --narrate):
 - classic: square crop, Whisper captions, bg music (the original pipeline).
-- narrated (--narrate): 9:16 vertical layout, SRT-driven captions, an LLM-written
-  scene narration read by TTS at low volume with the text shown beneath the video,
+- narrated: 9:16 vertical layout, SRT-driven captions, an LLM-written scene
+  narration read by TTS at low volume with the text shown beneath the video,
   and a thumbnail — the transformative-content format for monetization.
+- recap: a plot-recap montage. The body ranges (picked by recap.py) are cut to
+  the hand-picked music's beats, the movie dialogue is ducked under a loud music
+  bed, and the final few seconds are a beat-synced montage of iconic face shots
+  found by scanning the film.
 """
 
 import argparse
@@ -15,9 +19,23 @@ from pathlib import Path
 
 from burn import WATERMARKS, burn_subtitles, pick_random_audio
 from captions import build_ass
-from clip_selector import cut_and_concat, parse_ranges
+from clip_selector import cut_and_concat, parse_ranges, parse_timestamp
 from ffutil import get_duration, get_resolution
-from metadata import DEFAULT_MODEL, generate_metadata
+from outro import (
+    _outro_durations,
+    build_animated_outro,
+    detect_beats,
+    find_iconic_shots,
+    snap_cuts_to_beats,
+)
+from recap import suggest_recap
+from metadata import (
+    DEFAULT_EDITING_PROGRAM,
+    DEFAULT_MODEL,
+    build_edit_description,
+    clean_music_name,
+    generate_metadata,
+)
 from narration import generate_narration_beats
 from reformat import append_still_image
 from silence import detect_silences, keep_intervals, remap_time
@@ -179,6 +197,35 @@ def main() -> None:
                         help="Use one fixed --caption-color instead of cycling colours per sentence")
     parser.add_argument("--mirror", action="store_true",
                         help="Mirror (flip left-right) the clip footage only — captions/narration text stay upright")
+    # ── recap-format options ─────────────────────────────────────────────────
+    parser.add_argument("--mode", choices=["classic", "narrated", "recap"], default=None,
+                        help="Output format. 'recap' = beat-synced plot-recap montage. Overrides --narrate.")
+    parser.add_argument("--outro-seconds", type=float, default=5.0,
+                        help="Recap mode: length of the beat-synced iconic outro montage (default: 5)")
+    parser.add_argument("--outro-shots", default=None,
+                        help="Recap mode: comma-separated source timestamps (e.g. '1:02:10, 1:15:03') forced as "
+                             "outro shots, merged with the auto face-scan")
+    parser.add_argument("--auto-outro-shots", type=int, default=12,
+                        help="Recap mode: how many iconic face shots to auto-find for the outro (0 disables the scan)")
+    parser.add_argument("--no-outro", action="store_true",
+                        help="Recap mode: skip the iconic outro montage")
+    parser.add_argument("--target-seconds", type=float, default=120.0,
+                        help="Recap mode: total body length to aim for when auto-building ranges (default: 120)")
+    parser.add_argument("--recap-model", default=None,
+                        help="Recap mode: Ollama model for auto-building ranges from the whole subtitle file "
+                             "(default: a local model — the whole SRT is fed to it)")
+    # ── description credits (YouTube "edit" layout) ──────────────────────────
+    parser.add_argument("--edit-credits", action="store_true",
+                        help="Write the description in the edit layout: hook + Movie/Music/Editing Program "
+                             "credits + hashtags + fair-use disclaimer (default ON for recap)")
+    parser.add_argument("--no-edit-credits", action="store_true",
+                        help="Force the plain description even in recap mode")
+    parser.add_argument("--music-credit", default=None,
+                        help="Music track name for the 'Music:' credit line (default: derived from --bg-music filename)")
+    parser.add_argument("--editing-program", default=DEFAULT_EDITING_PROGRAM,
+                        help=f"'Editing Program:' credit line (default: {DEFAULT_EDITING_PROGRAM!r})")
+    parser.add_argument("--no-disclaimer", action="store_true",
+                        help="Omit the fair-use copyright disclaimer from the edit-style description")
     args = parser.parse_args()
 
     video_arg = args.video.strip().strip('"').strip("'") if args.video else None
@@ -187,9 +234,21 @@ def main() -> None:
         print(f"Error: video file not found: {video_path}")
         sys.exit(1)
 
-    ranges = parse_ranges(args.ranges) if args.ranges else prompt_ranges()
+    ranges = parse_ranges(args.ranges) if args.ranges else []
     source_title = args.source_title or filename_to_title(video_path)
-    layout_mode = args.layout or ("vertical" if args.narrate else "square")
+
+    # Format resolution: --mode wins; --narrate is the legacy alias for narrated.
+    mode = args.mode or ("narrated" if args.narrate else "classic")
+    is_recap = mode == "recap"
+    if is_recap:
+        args.narrate = False  # recap has no TTS narration; it's music + ducked dialogue
+    layout_mode = args.layout or ("vertical" if (args.narrate or is_recap) else "square")
+
+    # Non-recap needs explicit ranges (prompt when interactive). Recap with no
+    # ranges auto-builds them from the whole subtitle file further down — "if
+    # nothing is given, default to the full movie".
+    if not ranges and not is_recap:
+        ranges = prompt_ranges()
 
     # Release year (from the filename) → shown after the movie name on the thumbnail.
     year_match = _YEAR_RE.search(video_path.stem)
@@ -206,6 +265,22 @@ def main() -> None:
             sys.exit(1)
     else:
         srt_path = find_srt_for_video(video_path)
+
+    # Recap mode has two hard requirements: the subtitle file (it drives both the
+    # beat picks and the burned captions) and a music track (the whole edit is
+    # cut to its beats). Fail fast with a clear message rather than half-render.
+    recap_music: Path | None = None
+    if is_recap:
+        if srt_path is None:
+            print("Error: recap mode needs a subtitle file (--srt) — it drives the captions.")
+            sys.exit(1)
+        if not args.bg_music:
+            print("Error: recap mode needs a music track (--bg-music) — the edit is cut to its beats.")
+            sys.exit(1)
+        recap_music = Path(args.bg_music)
+        if not recap_music.is_file():
+            print(f"Error: music track not found: {recap_music}")
+            sys.exit(1)
 
     if args.clip_dir:
         # Phase 2 (or reuse): an existing dir prepared earlier — keep its clip_raw
@@ -252,13 +327,87 @@ def main() -> None:
     # A thumbnail is composed whenever the narrated format needs one OR it's
     # being baked into the video (--prepend-thumbnail), so every pick-first run —
     # classic included — accounts for the compose + bake steps.
-    want_thumbnail = args.narrate or args.prepend_thumbnail
+    want_thumbnail = args.narrate or args.prepend_thumbnail or is_recap
     total_steps = (5
-                   + (1 if args.remove_silence else 0)
+                   + (2 if is_recap else 0)                # recap: beat/shot analysis + animated outro
+                   + (1 if (args.remove_silence and not is_recap) else 0)
                    + (2 if args.narrate else 0)            # narration beats + voiceover
                    + (1 if want_thumbnail else 0)          # compose/use thumbnail
                    + (1 if args.prepend_thumbnail else 0)) # bake thumbnail into video
     step = StepPrinter(total_steps)
+
+    # Recap analysis: beat-track the music, snap the body clips onto the beat
+    # grid, and build the beat-synced iconic outro. cut_ranges (body + outro) is
+    # what gets cut; caption_ranges (body only) is what gets captioned — the
+    # outro flashes carry no dialogue.
+    cut_ranges = ranges
+    caption_ranges = ranges
+    recap_shot_times: list[float] = []
+    recap_outro_durations: list[float] = []
+    recap_body_duration = 0.0
+    if is_recap:
+        step("Building recap from subtitles + analyzing music beats + iconic shots...")
+        # How recap reads the provided ranges:
+        #   - SHORT ones (<=30s) are literal beats — a hand-picked beat or the
+        #     Build-recap preview the user tweaked → use them as-is.
+        #   - a LONG one (>30s) is a TIME REGION to scope the recap to ("recap
+        #     this stretch of the movie") → auto-pick short beats within it.
+        #   - none → auto-pick from the whole movie.
+        # This also prevents a long span (e.g. "00:00-40:00") from being cut as a
+        # single 40-minute beat, which cut+captioned+burned a huge vertical and
+        # looked hung. The LLM feed is always a LOCAL model by default — the whole
+        # (or scoped) SRT goes into the prompt and the user is bandwidth-sensitive.
+        _f = lambda t: f"{int(t // 60)}:{int(t % 60):02d}"
+        literal = [(s, e) for s, e in ranges if e - s <= 30.0]
+        regions = [(s, e) for s, e in ranges if e - s > 30.0]
+        if literal and not regions:
+            ranges = literal
+        else:
+            recap_model = args.recap_model or "gemma4:e4b"
+            if regions:
+                print("      -> scoping recap to region(s) "
+                      + ", ".join(f"{_f(s)}-{_f(e)}" for s, e in regions)
+                      + f", picking beats via {recap_model}...")
+            else:
+                print(f"      -> no clip ranges — building recap from the whole subtitle file ({recap_model})...")
+            built = suggest_recap(srt_path, source_title=source_title, model=recap_model,
+                                  target_seconds=args.target_seconds, region=regions or None)
+            ranges = [(b["start"], b["end"]) for b in built]
+            if not ranges:
+                print("Error: recap produced no beats. Try the Build-recap button, or pass short --ranges.")
+                sys.exit(1)
+            print(f"      -> built {len(ranges)} beats (~{sum(e - s for s, e in ranges):.0f}s)")
+        beats = detect_beats(recap_music)
+        snapped_body = snap_cuts_to_beats(ranges, beats)
+        caption_ranges = snapped_body
+        video_duration = get_duration(video_path)
+
+        shot_times: list[float] = []
+        if args.outro_shots:
+            for tok in re.split(r"[;,]", args.outro_shots):
+                tok = tok.strip()
+                if not tok:
+                    continue
+                try:
+                    shot_times.append(parse_timestamp(tok))
+                except ValueError:
+                    print(f"      ! ignoring unparseable outro timestamp {tok!r}")
+        if not args.no_outro and args.auto_outro_shots > 0:
+            try:
+                found = find_iconic_shots(video_path, count=args.auto_outro_shots)
+                shot_times += [s["time"] for s in found]
+                print(f"      -> face-scan found {len(found)} iconic shot(s)")
+            except Exception as exc:
+                print(f"      ! iconic-shot scan failed ({exc}); using hand-picked shots only")
+
+        recap_body_duration = sum(e - s for s, e in snapped_body)
+        cut_ranges = snapped_body  # the outro is now a separate ANIMATED segment, not cut ranges
+        if not args.no_outro and shot_times:
+            recap_shot_times = sorted(set(shot_times))
+            recap_outro_durations = _outro_durations(
+                beats, recap_body_duration, args.outro_seconds, len(recap_shot_times))
+        print(f"      -> {len(beats)} beats | {len(snapped_body)} body clips snapped "
+              f"(~{recap_body_duration:.0f}s) | {len(recap_shot_times)} outro face still(s)")
 
     # Only reuse a prepared cut when it was cut from THIS video and THESE
     # ranges — otherwise re-cut. A stale reuse renders the old clip's video
@@ -286,8 +435,8 @@ def main() -> None:
         step(f"Reusing prepared raw clip ({raw_clip_path.name})...")
         print(f"      -> {raw_clip_path}")
     else:
-        step(f"Cutting {len(ranges)} range(s) from source video...")
-        cut_and_concat(video_path, ranges, raw_clip_path)
+        step(f"Cutting {len(cut_ranges)} range(s) from source video...")
+        cut_and_concat(video_path, cut_ranges, raw_clip_path)
         print(f"      -> {raw_clip_path}")
     clip_duration = get_duration(raw_clip_path)
 
@@ -296,7 +445,7 @@ def main() -> None:
     # the Whisper path needs no remap because it transcribes the trimmed clip.
     framing_src = raw_clip_path
     silence_keeps: list[tuple[float, float]] | None = None
-    if args.remove_silence:
+    if args.remove_silence and not is_recap:
         step("Removing blank spaces (near-silent gaps)...")
         silences = detect_silences(raw_clip_path)
         keeps = keep_intervals(clip_duration, silences)
@@ -332,7 +481,7 @@ def main() -> None:
 
     if srt_path:
         step("Extracting dialogue captions from subtitle file...")
-        cues = cues_for_ranges(parse_srt(srt_path), ranges)
+        cues = cues_for_ranges(parse_srt(srt_path), caption_ranges)
         if silence_keeps:
             # Shift cue times onto the silence-trimmed timeline (cues sit in
             # the kept spans by definition — silence has no dialogue).
@@ -381,11 +530,33 @@ def main() -> None:
     if args.title:
         meta["title"] = args.title
         print(f"      -> title override: {args.title!r}")
+
+    # Description layout: the "edit" style (Movie/Music/Editing Program credits +
+    # hashtags + fair-use disclaimer) is the default for recap, opt-in elsewhere.
+    # The tool is never named; the editing program is credited as After Effects.
+    edit_credits = (args.edit_credits or is_recap) and not args.no_edit_credits
+    if edit_credits:
+        music_credit = args.music_credit
+        if not music_credit and args.bg_music:
+            music_credit = clean_music_name(Path(args.bg_music).stem)
+        styled = build_edit_description(
+            meta,
+            movie_label=movie_label,
+            movie_tag=source_title,
+            music=music_credit or "",
+            editing_program=args.editing_program,
+            disclaimer=not args.no_disclaimer,
+        )
+        # Put the styled block in both files so whatever consumes metadata.json
+        # (e.g. the Agent Hub upload card) shows the same description.
+        meta["description"] = styled
+        description_path.write_text(styled, encoding="utf-8")
+    else:
+        description_path.write_text(
+            f"{meta['title']}\n\n{meta['description']}",
+            encoding="utf-8",
+        )
     metadata_path.write_text(json.dumps(meta, indent=2), encoding="utf-8")
-    description_path.write_text(
-        f"{meta['title']}\n\n{meta['description']}",
-        encoding="utf-8",
-    )
     print(f"      -> {metadata_path}")
 
     step("Building captions + title card...")
@@ -404,6 +575,10 @@ def main() -> None:
     print(f"      -> {ass_path}")
 
     step("Framing + burning captions into video + mixing audio...")
+    # Recap wants a loud music bed — bump the default if the user left it at the
+    # classic 0.10 (the web UI sends its own recap value and overrides this).
+    if is_recap and abs(args.bg_volume - 0.10) < 1e-9:
+        args.bg_volume = 0.6
     bg_music_path: Path | None = None
     if not args.no_bg_music:
         if args.bg_music:
@@ -434,8 +609,61 @@ def main() -> None:
         narration_volume=args.narration_volume,
         pre_filter=pre_filter,
         mirror=args.mirror,
+        music_duck=is_recap,
     )
     print(f"      -> {final_path}")
+
+    # Recap: build the ANIMATED iconic outro (enhanced face stills, beat-timed
+    # zoom-out + fade, watermark, music) and append it after the captioned body.
+    if is_recap and recap_shot_times:
+        step("Building animated iconic outro (enhanced face stills)...")
+        # NON-FATAL: the captioned body is already rendered to final_path. If the
+        # outro build or concat fails for any reason, keep the body rather than
+        # letting the whole render die — that cascade lost a good body video.
+        import subprocess as _sp
+        import tempfile as _tf
+        import os as _os
+        try:
+            outro_path = clip_dir / "outro.mp4"
+            # Build the outro at the BODY's framerate so the concat below doesn't
+            # choke on mismatched fps (the usual reason it "never attached").
+            try:
+                _fp = _sp.run(["ffprobe", "-v", "error", "-select_streams", "v",
+                               "-show_entries", "stream=r_frame_rate", "-of",
+                               "default=nw=1:nk=1", str(final_path)],
+                              capture_output=True, text=True, check=True)
+                _num, _den = _fp.stdout.strip().split("/")
+                body_fps = max(1, int(round(float(_num) / float(_den))))
+            except Exception:
+                body_fps = 30
+            build_animated_outro(
+                video_path, recap_shot_times, recap_outro_durations, outro_path,
+                size=frame_size, fps=body_fps, watermark_text=watermark_text,
+                music_path=bg_music_path, music_start=recap_body_duration,
+                music_volume=args.bg_volume,
+            )
+            # Use the concat FILTER, not the demuxer: the demuxer silently DROPS
+            # frames when the two files' framerates differ even slightly (body
+            # 24000/1001 vs outro 24/1), leaving a frozen frame + music at the end.
+            # The filter re-times both video and audio to a common fps for a clean
+            # join with no dropped outro frames and no audio spike.
+            merged = clip_dir / "merged.mp4"
+            _W, _H = frame_size
+            _sp.run(["ffmpeg", "-y", "-i", str(final_path), "-i", str(outro_path),
+                     "-filter_complex",
+                     f"[0:v]fps={body_fps},scale={_W}:{_H},setsar=1[v0];"
+                     f"[1:v]fps={body_fps},scale={_W}:{_H},setsar=1[v1];"
+                     f"[v0][v1]concat=n=2:v=1:a=0[v];"
+                     f"[0:a][1:a]concat=n=2:v=0:a=1[a]",
+                     "-map", "[v]", "-map", "[a]",
+                     "-c:v", "libx264", "-crf", "18", "-preset", "veryfast",
+                     "-c:a", "aac", "-b:a", "192k", "-pix_fmt", "yuv420p", str(merged)],
+                    check=True, capture_output=True)
+            _os.replace(str(merged), str(final_path))
+            print(f"      -> appended animated outro -> {final_path}")
+        except Exception as exc:
+            detail = exc.stderr.decode(errors="replace")[-400:] if isinstance(exc, _sp.CalledProcessError) and exc.stderr else str(exc)
+            print(f"      ! animated outro failed, keeping the body video without it:\n        {detail}")
 
     if want_thumbnail:
         if thumbnail_path.is_file() and args.clip_dir:

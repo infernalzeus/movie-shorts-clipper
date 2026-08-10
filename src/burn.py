@@ -6,6 +6,15 @@ from pathlib import Path
 
 _AUDIO_EXTS = {".mp3", ".wav", ".ogg", ".aac", ".flac", ".m4a"}
 
+# Recap mix: the movie DIALOGUE is the lead and the music is a bed that ducks
+# UNDER it (classic voice-over sidechain). Movie dialogue is quiet + dynamic
+# (~-26 dB) while music is loudness-maximised (~-6 dB), so the dialogue is first
+# lifted/evened with dynaudnorm and NEVER ducked; the music is keyed off the
+# dialogue so it drops out of the way whenever someone is speaking.
+# Gentle lift (makeup 5, ratio 3) — enough to bring quiet dialogue up without
+# slamming peaks into the limiter (makeup 8 did that = the "tearing" distortion).
+_RECAP_DIALOGUE_NORM = "acompressor=threshold=-26dB:ratio=3:attack=10:release=250:makeup=5"
+
 # Available watermarks — add more entries here to extend the selectable list later.
 WATERMARKS: dict[str, str] = {
     "mv-edits": "MV EDITS",
@@ -53,6 +62,7 @@ def burn_subtitles(
     narration_volume: float = 0.04,
     pre_filter: str | None = None,
     mirror: bool = False,
+    music_duck: bool = False,
 ) -> Path:
     """Burn the .ass captions into the video and mix the audio layers:
     movie audio (full, unchanged) + narration voiceover at narration_volume,
@@ -123,6 +133,47 @@ def burn_subtitles(
                 "ffmpeg", "-y",
                 *inputs,
                 "-filter_complex", ";".join(chains),
+                "-vf", vf,
+                "-map", "0:v", "-map", "[aout]",
+                "-c:v", "libx264", "-crf", "18", "-preset", "slow",
+                "-c:a", "aac", "-b:a", "192k",
+                str(output_path),
+            ])
+        elif bg_music and music_duck:
+            # Recap Montage mix: the MUSIC is the bed and stays loud; the movie's
+            # own dialogue plays underneath and ducks further whenever the music
+            # is loud (sidechaincompress keyed off the music). This is the
+            # "music-forward, dialogue ducked" look of recap edits — the opposite
+            # of the narrated branch, where the movie audio leads.
+            dur = _get_duration(video_path)
+            norm = "aresample=48000,aformat=channel_layouts=stereo"
+            # bg music: skip a lead-in (optional), loop to fill, hard-trim to the
+            # clip length (an unbounded pad would deadlock the downstream amix),
+            # then split — one copy keys the compressor, one copy is mixed in.
+            # Voice-over ducking: the MUSIC ducks under the dialogue, not the
+            # other way round. [mvkey] (the lifted dialogue) keys a hard sidechain
+            # compressor on the music, so whenever anyone speaks the bed drops far
+            # out of the way; in the gaps between dialogue the music returns to its
+            # `bg_volume` resting level. The dialogue path [mvout] is never touched.
+            # alimiter catches summed peaks so nothing clips.
+            # Pad the movie audio to EXACTLY the video length (apad then atrim to
+            # `dur`) so the mixed audio always spans the full video — otherwise the
+            # body audio can end a touch before the video and it "continues without
+            # sound". The padded tail carries no dialogue, so the sidechain doesn't
+            # duck the music there and the bed keeps playing to the very end.
+            filter_complex = (
+                f"[0:a]{norm},{_RECAP_DIALOGUE_NORM},apad,atrim=0:{dur},asetpts=N/SR/TB[mv];"
+                f"[mv]asplit=2[mvkey][mvout];"
+                f"[1:a]{bg_pre}aloop=loop=-1:size=2000000000,atrim=0:{dur},"
+                f"volume={bg_volume},{norm}[bg];"
+                f"[bg][mvkey]sidechaincompress=threshold=0.05:ratio=2:attack=50:release=1200[bgduck];"
+                f"[mvout][bgduck]amix=inputs=2:duration=longest:normalize=0,alimiter=limit=0.95[aout]"
+            )
+            _run_ffmpeg([
+                "ffmpeg", "-y",
+                "-i", str(video_path),
+                "-i", str(bg_music),
+                "-filter_complex", filter_complex,
                 "-vf", vf,
                 "-map", "0:v", "-map", "[aout]",
                 "-c:v", "libx264", "-crf", "18", "-preset", "slow",
