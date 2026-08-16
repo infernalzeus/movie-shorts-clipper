@@ -92,7 +92,7 @@ def _condense(cues: list[Cue]) -> str:
 
 
 _SENTENCE_END_RE = re.compile(r"[.!?…][\"'”’)\]]*\s*$")
-_MAX_SENTENCE_WALK = 8   # cues to extend in each direction hunting for sentence ends
+_MAX_SENTENCE_WALK = 16  # cues to extend in each direction hunting for sentence ends
 _SENTENCE_GAP = 3.0      # a dialogue gap this long counts as a boundary too
 
 

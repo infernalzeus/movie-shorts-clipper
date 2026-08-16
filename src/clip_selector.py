@@ -39,8 +39,14 @@ def parse_ranges(ranges_str: str) -> list[tuple[float, float]]:
     return ranges
 
 
-def cut_and_concat(video_path: Path, ranges: list[tuple[float, float]], output_path: Path) -> Path:
-    """Cut each (start, end) range from video_path and concatenate them in order into output_path."""
+def cut_and_concat(video_path: Path, ranges: list[tuple[float, float]], output_path: Path,
+                   fade_edges: bool = False) -> Path:
+    """Cut each (start, end) range from video_path and concatenate them in order into output_path.
+
+    fade_edges: fade each segment in from black and out to black at its own edges
+    (~0.15s), so scenes dip smoothly between each other instead of hard-cutting.
+    Segment durations are unchanged, so downstream caption timing stays in sync.
+    """
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
     with tempfile.TemporaryDirectory(prefix="movie-shorts-") as tmp:
@@ -49,6 +55,15 @@ def cut_and_concat(video_path: Path, ranges: list[tuple[float, float]], output_p
 
         for i, (start, end) in enumerate(ranges):
             segment_path = tmp_dir / f"segment_{i:02d}.mp4"
+            fade_args: list[str] = []
+            if fade_edges:
+                seg = end - start
+                fd = min(0.15, seg / 4)
+                out_st = max(0.0, seg - fd)
+                fade_args = [
+                    "-vf", f"fade=t=in:st=0:d={fd:.3f},fade=t=out:st={out_st:.3f}:d={fd:.3f}",
+                    "-af", f"afade=t=in:st=0:d={fd:.3f},afade=t=out:st={out_st:.3f}:d={fd:.3f}",
+                ]
             try:
                 subprocess.run(
                     [
@@ -56,6 +71,7 @@ def cut_and_concat(video_path: Path, ranges: list[tuple[float, float]], output_p
                         "-ss", str(start),
                         "-i", str(video_path),
                         "-t", str(end - start),
+                        *fade_args,
                         # -ac 2/-ar 48000: movies often carry 5.1 (or oddly
                         # tagged) audio; without normalizing here the unknown
                         # 6ch layout survives into burn.py's amix, where the

@@ -877,7 +877,10 @@ async def start_run(request: web.Request) -> web.Response:
     # Output shape: 9:16 vertical by default; the Square checkbox forces 1:1.
     # Narration needs the vertical band beneath the video, so a narrated edit is
     # always vertical regardless of the checkbox.
-    layout = "square" if (data.get("square") and mode != "narrated") else "vertical"
+    aspect = (data.get("aspect") or "vertical").strip()
+    layout = aspect if aspect in ("vertical", "square", "landscape") else "vertical"
+    if mode == "narrated":
+        layout = "vertical"   # the narration text band needs the vertical space
     args += ["--layout", layout]
     if data.get("remove_silence"):
         args += ["--remove-silence"]
@@ -1291,10 +1294,12 @@ summary{font-size:12px;color:var(--text-muted);cursor:pointer;padding:4px 0}
       <input type="checkbox" id="mirror" style="accent-color:var(--accent)">
       <span>Mirror clip — flip the footage left-right (captions &amp; narration stay upright)</span>
     </label>
-    <label style="display:flex;align-items:center;gap:8px;cursor:pointer;margin-top:12px">
-      <input type="checkbox" id="square" style="accent-color:var(--accent)">
-      <span>Square output (1:1) — otherwise 9:16 vertical (ignored when narration is on)</span>
-    </label>
+    <label for="aspect" style="margin-top:12px">Output shape</label>
+    <select id="aspect">
+      <option value="vertical" selected>9:16 vertical — Shorts / TikTok (under 3 min)</option>
+      <option value="square">1:1 square</option>
+      <option value="landscape">16:9 landscape — long-form / regular YouTube</option>
+    </select>
   </fieldset>
 
   <fieldset>
@@ -2152,7 +2157,7 @@ function buildPayload(ranges, usePrepared) {
     prepared_ranges: usePrepared ? preparedRanges : null,
     remove_silence: document.getElementById('remove_silence').checked,
     mirror: document.getElementById('mirror').checked,
-    square: document.getElementById('square').checked,
+    aspect: document.getElementById('aspect').value,
     caption_font: document.getElementById('caption_font').value,
     caption_animation: document.getElementById('caption_animation').value,
     caption_shuffle: document.getElementById('caption_shuffle').checked,

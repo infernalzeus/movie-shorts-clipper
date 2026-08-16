@@ -1,0 +1,58 @@
+{
+  "nodes": [
+    {"id":"title","type":"text","x":-380,"y":-620,"width":760,"height":90,"color":"1","text":"# Movie Shorts Clipper — Architecture\nOne movie + subtitles in → captioned/narrated video out. The TIMELINE RANGE you give scopes which part of the subtitles the LLM reads."},
+
+    {"id":"orch","type":"text","x":-380,"y":-500,"width":760,"height":110,"color":"1","text":"**main.py** — the orchestrator (CLI)\nRuns the whole pipeline for the chosen MODE: pick clips → cut → frame → caption/narrate → mix audio → metadata → output.\n\n**web/app.py** — the web UI (aiohttp) that drives main.py and shows progress. Format selector picks the mode; Output-shape picks 9:16 / 1:1 / 16:9."},
+
+    {"id":"g_in","type":"text","x":-1500,"y":-360,"width":300,"height":40,"color":"4","text":"## 1 · INPUTS"},
+    {"id":"in_movie","type":"text","x":-1500,"y":-300,"width":300,"height":80,"color":"4","text":"**Movie file** (.mkv/.mp4)\nThe source footage. Never modified — only cut from."},
+    {"id":"in_srt","type":"text","x":-1500,"y":-200,"width":300,"height":90,"color":"4","text":"**Subtitle file** (.srt)\nThe movie's dialogue with timestamps. This is what the LLM reads to understand + pick scenes."},
+    {"id":"in_range","type":"text","x":-1500,"y":-90,"width":300,"height":90,"color":"4","text":"**Timeline range** (optional)\ne.g. 30:00-45:00. Scopes the story: only subtitles inside it are fed to the LLM. Empty = whole movie."},
+
+    {"id":"g_parse","type":"text","x":-1120,"y":-360,"width":300,"height":40,"color":"5","text":"## 2 · READ"},
+    {"id":"subtitles","type":"text","x":-1120,"y":-300,"width":300,"height":90,"color":"5","text":"**subtitles.py**\nParses the .srt into timed dialogue lines (cues) and maps them onto the cut-clip timeline."},
+    {"id":"transcriber","type":"text","x":-1120,"y":-200,"width":300,"height":80,"color":"5","text":"**transcriber.py** (Whisper)\nFallback: transcribes the audio when there is NO subtitle file."},
+
+    {"id":"g_pick","type":"text","x":-740,"y":-360,"width":320,"height":40,"color":"6","text":"## 3 · PICK (LLM reads subs)"},
+    {"id":"scenes","type":"text","x":-740,"y":-300,"width":320,"height":80,"color":"6","text":"**scenes.py**\nLLM suggests single standalone clip-worthy scenes (for Classic)."},
+    {"id":"recap","type":"text","x":-740,"y":-200,"width":320,"height":100,"color":"6","text":"**recap.py**\nLLM picks a CHAIN of short story beats (a montage that retells the plot). Snaps cuts to complete sentences. Short-form (<3 min)."},
+    {"id":"narrative","type":"text","x":-740,"y":-80,"width":320,"height":100,"color":"6","text":"**narrative.py**\nLLM writes a CONNECTED long-form story script: clip start + the narrator's line for each. Long-form (16:9)."},
+    {"id":"metadata","type":"text","x":-740,"y":50,"width":320,"height":90,"color":"6","text":"**metadata.py**\nLLM writes the YouTube title / description / tags. Edit-style description (film blurb + credits + hashtags + fair-use)."},
+
+    {"id":"g_build","type":"text","x":-360,"y":-360,"width":320,"height":40,"color":"2","text":"## 4 · BUILD"},
+    {"id":"clipsel","type":"text","x":-360,"y":-300,"width":320,"height":90,"color":"2","text":"**clip_selector.py**\nCuts the chosen time ranges out of the movie and joins them into one clip (optional fade between scenes)."},
+    {"id":"tts","type":"text","x":-360,"y":-200,"width":320,"height":80,"color":"2","text":"**tts.py** (edge-tts) + **narration.py**\nTurn narration text into a voiceover, placed in time over the clips."},
+    {"id":"captions","type":"text","x":-360,"y":-110,"width":320,"height":80,"color":"2","text":"**captions.py**\nBuilds the .ass subtitle file: karaoke captions or narration subtitles + title card."},
+    {"id":"burn","type":"text","x":-360,"y":-20,"width":320,"height":100,"color":"2","text":"**burn.py** (ffmpeg)\nFRAMES the video (9:16 / 1:1 / 16:9), burns the captions, and MIXES the audio (dialogue / narration voice-over ducking / music bed)."},
+    {"id":"outro","type":"text","x":-360,"y":90,"width":320,"height":90,"color":"2","text":"**outro.py**\nRecap's animated ending: slow-mo face clips + zoom + glow titles + blackout, cut to the music."},
+    {"id":"extras","type":"text","x":-360,"y":190,"width":320,"height":90,"color":"2","text":"**thumbnail.py** · **silence.py** · **ffutil.py** · **reformat.py**\nThumbnail image, silent-gap removal, ffmpeg helpers, thumbnail-bake."},
+
+    {"id":"g_modes","type":"text","x":60,"y":-360,"width":340,"height":40,"color":"3","text":"## 5 · MODES → OUTPUT"},
+    {"id":"m_classic","type":"text","x":60,"y":-300,"width":340,"height":80,"color":"3","text":"**Classic**\nYou give timestamps → captioned Short. Karaoke captions, square/vertical."},
+    {"id":"m_narrated","type":"text","x":60,"y":-205,"width":340,"height":90,"color":"3","text":"**Narrated**\nSRT captions + a light TTS narration + text band. Vertical. The original monetization format."},
+    {"id":"m_recap","type":"text","x":60,"y":-100,"width":340,"height":100,"color":"3","text":"**Recap** (SHORT-FORM, <3 min)\nLLM montage of story beats + animated iconic outro. 9:16 or 1:1. Music-forward with ducked dialogue."},
+    {"id":"m_narr","type":"text","x":60,"y":15,"width":340,"height":110,"color":"3","text":"**Narrative** (LONG-FORM, ~8-10 min)\nNarrator retells the whole story over 16:9 clips. Narrator-only audio (movie muted = safest for Content ID) + optional music. Burned narration subtitles + chapters. [being built]"},
+
+    {"id":"note_arch","type":"text","x":60,"y":150,"width":340,"height":150,"color":"1","text":"### Architecture note\nTwo things are ORTHOGONAL:\n- **Content mode** = what to make (Classic / Recap / Narrative). Narration is an OPTION, not really its own mode.\n- **Output shape** = 9:16 / 1:1 / 16:9, chosen separately.\n\nRule of thumb: **Recap = short (<3 min, vertical/square)**, **Narrative = long (16:9)**."},
+
+    {"id":"note_cut","type":"text","x":-740,"y":190,"width":320,"height":170,"color":"1","text":"### Known issue: clip boundaries\nCuts use SUBTITLE timestamps, which can lag/lead the actual spoken audio → a line gets chopped or bleeds in from the next clip.\n\n**Fix (proposed):** before rendering, verify each clip's real speech boundaries against the AUDIO (Whisper/silence detection) and snap the cut to where the sentence actually starts/ends — not just where the subtitle appears."}
+  ],
+  "edges": [
+    {"id":"e1","fromNode":"in_srt","toNode":"subtitles","fromSide":"right","toSide":"left"},
+    {"id":"e2","fromNode":"in_movie","toNode":"clipsel","fromSide":"right","toSide":"left","label":"cut from"},
+    {"id":"e3","fromNode":"in_range","toNode":"recap","fromSide":"right","toSide":"left","label":"scopes"},
+    {"id":"e4","fromNode":"subtitles","toNode":"scenes","fromSide":"right","toSide":"left"},
+    {"id":"e5","fromNode":"subtitles","toNode":"recap","fromSide":"right","toSide":"left"},
+    {"id":"e6","fromNode":"subtitles","toNode":"narrative","fromSide":"right","toSide":"left"},
+    {"id":"e7","fromNode":"recap","toNode":"clipsel","fromSide":"right","toSide":"left","label":"ranges"},
+    {"id":"e8","fromNode":"narrative","toNode":"tts","fromSide":"right","toSide":"left","label":"script"},
+    {"id":"e9","fromNode":"clipsel","toNode":"burn","fromSide":"bottom","toSide":"top"},
+    {"id":"e10","fromNode":"tts","toNode":"burn","fromSide":"bottom","toSide":"top"},
+    {"id":"e11","fromNode":"captions","toNode":"burn","fromSide":"bottom","toSide":"top"},
+    {"id":"e12","fromNode":"burn","toNode":"m_recap","fromSide":"right","toSide":"left"},
+    {"id":"e13","fromNode":"burn","toNode":"m_narr","fromSide":"right","toSide":"left"},
+    {"id":"e14","fromNode":"outro","toNode":"m_recap","fromSide":"right","toSide":"left","label":"ending"},
+    {"id":"e15","fromNode":"metadata","toNode":"m_narr","fromSide":"right","toSide":"left","label":"title/desc"},
+    {"id":"e16","fromNode":"orch","toNode":"g_pick","fromSide":"bottom","toSide":"top"}
+  ]
+}

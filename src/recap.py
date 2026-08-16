@@ -30,8 +30,8 @@ if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
 # Recap beats are short — a beat is a single moment, not a whole scene.
-_MIN_BEAT = 3.0
-_MAX_BEAT = 12.0
+_MIN_BEAT = 2.5    # allow short/shortest punchy lines too, as long as they're complete
+_MAX_BEAT = 10.0
 _DEFAULT_TARGET = 120.0   # total body seconds to aim for (before the outro)
 
 _PROMPT_TEMPLATE = """You are cutting a fast RECAP of the movie "{source_title}" — a montage that retells the whole plot in short beats, in order, the way movie-recap channels do.
@@ -48,13 +48,16 @@ Below is the movie's dialogue, condensed from the subtitles, in time order. Each
 {condensed}
 ---
 
-Pick {count} short beats that together tell the WHOLE story from start to finish, IN CHRONOLOGICAL ORDER. Cover the arc: the setup and main characters, the inciting incident, the major turning points and reversals, the climax, and the resolution. Spread the beats across the entire runtime — do NOT bunch them all near the start.
+Pick {count} beats that together tell a CONNECTED story a viewer can follow, IN CHRONOLOGICAL ORDER. Cover the arc: the setup and main characters, the inciting incident, the major turning points, and — most importantly — build to the CLIMAX. It is fine if the most exciting material is early; pick the moments that actually carry the plot, wherever they fall.
+
+PRIORITISE THE PAYOFF: the biggest reveal, twist, or final confrontation is the most important beat. The recap should build toward it and END on it — the LAST beat should be the decisive line of that moment (the ultimate thing said), not a quiet wind-down after it.
 
 Rules for each beat:
-- Each beat is a single punchy moment {min_beat:.0f}-{max_beat:.0f} seconds long. Prefer the shorter end — this is a fast montage.
-- Beats must be in chronological order and must NOT overlap each other.
-- Start and end on COMPLETE lines of dialogue — never cut off mid-sentence.
-- Favor lines that carry the plot forward (a reveal, a decision, a threat, a death, a twist) over filler.
+- Each beat is a COMPLETE thought or exchange — a full statement, or a short back-and-forth (a line and its reaction) that MAKES SENSE ON ITS OWN. Never a sentence fragment.
+- Aim for about 7 seconds each ({min_beat:.0f}-{max_beat:.0f}s) — long enough to land the exchange, not so long it drags. Start on the first word of a line and end on the last word of a line — never mid-sentence.
+- The beats read back-to-back, so favor lines that CONNECT: each should follow from the last so the recap feels like one story, not disconnected clips.
+- Chronological, non-overlapping. Favor plot-carrying lines (a reveal, a decision, a threat, a death, a twist) over filler or small talk.
+- FEWER, meatier beats beat many tiny ones.
 
 Respond with ONLY a JSON object in this exact shape:
 {{
@@ -106,8 +109,8 @@ def suggest_recap(
 
     # Aim a little high on the beat count — validation drops some, and we trim
     # to the duration budget at the end anyway.
-    avg_beat = (min_beat + max_beat) / 2
-    count = max(8, min(30, round(target_seconds / avg_beat) + 4))
+    avg_beat = (min_beat + max_beat) / 2   # ~7.5s
+    count = max(4, min(20, round(target_seconds / avg_beat) + 2))
 
     prompt = _PROMPT_TEMPLATE.format(
         source_title=title,
@@ -148,10 +151,16 @@ def suggest_recap(
         if end - start > max_beat * 1.6:
             end = start + max_beat
         start, end = _snap_to_cues(cues, start, end)
-        # Snapping can widen a beat past the montage budget — trim the tail back.
-        if end - start > max_beat:
-            end = start + max_beat
-        if end - start < min_beat or end - start > max_beat + 2:
+        end = min(movie_end + 1.0, end + 0.4)   # extra tail: subtitle end lags the audio
+        # Do NOT trim the end back to max_beat — that chopped dialogue mid-sentence.
+        # _snap_to_cues put the end on a complete-sentence boundary (with padding),
+        # so the spoken line finishes; if that makes a beat run long, trim the
+        # START forward to the nearest cue instead, keeping the end intact.
+        if end - start > max_beat + 4:
+            keep = [c for c in cues if c.start >= end - (max_beat + 2) and c.start < end]
+            if keep:
+                start = keep[0].start
+        if end - start < min_beat or end - start > max_beat + 8:
             continue
         # Drop anything that runs backwards or overlaps the previous beat.
         if start < prev_end:
@@ -167,6 +176,31 @@ def suggest_recap(
         total += end - start
         if total >= target_seconds:
             break
+
+    # Fallback: the LLM returned nothing usable (common with a small local model
+    # or a narrow scoped region). Pick dialogue beats straight from the SRT
+    # timestamps instead — spread evenly across the cues, each a short beat sized
+    # by the cue's own duration. No LLM needed; dialogue sync = the SRT timing.
+    if not beats:
+        want = max(4, int(target_seconds / ((min_beat + max_beat) / 2)))
+        step_n = max(1, len(cues) // want)
+        for c in cues[::step_n]:
+            s, e = _snap_to_cues(cues, c.start, min(c.end, c.start + max_beat))
+            if e - s > max_beat:
+                e = s + max_beat
+            if e - s < min_beat or s < prev_end:
+                continue
+            beats.append({
+                "start": round(s, 1),
+                "end": round(e, 1),
+                "range": f"{_fmt_ts(s)}-{_fmt_ts(e)}",
+                "title": (c.text or "").strip()[:48],
+                "reason": "auto (SRT timing)",
+            })
+            prev_end = e
+            total += e - s
+            if total >= target_seconds:
+                break
 
     return beats
 

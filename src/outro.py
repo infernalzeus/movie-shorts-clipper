@@ -88,9 +88,11 @@ def find_iconic_shots(
     video_path: Path,
     count: int = 12,
     region: tuple[float, float] = (0.55, 0.98),
-    sample_every: float = 1.5,
+    sample_every: float = 1.0,
     min_gap: float = 2.0,
     max_samples: int = 500,
+    windows: list[tuple[float, float]] | None = None,
+    min_score: float = 0.0,
 ) -> list[dict]:
     """Scan `video_path` for close-up frontal faces and return the best shots.
 
@@ -121,26 +123,42 @@ def find_iconic_shots(
     cascade_path = cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
     detector = cv2.CascadeClassifier(cascade_path)
 
-    start_t = region[0] * duration
-    end_t = region[1] * duration
-    # Widen the step if needed so we decode at most max_samples frames.
-    step = max(sample_every, (end_t - start_t) / max_samples)
-    candidates: list[dict] = []
+    # Sample inside the given windows (the recap beats) if provided, else across
+    # `region`. This makes the outro's faces come from the story just shown.
+    spans = windows if windows else [(region[0] * duration, region[1] * duration)]
+    spans = [(max(0.0, s), min(duration, e)) for s, e in spans if e > s]
+    total_span = sum(e - s for s, e in spans) or 1.0
+    step = max(sample_every, total_span / max_samples)
+    sample_times: list[float] = []
+    for s, e in spans:
+        t = s
+        while t < e:
+            sample_times.append(t)
+            t += step
 
-    t = start_t
-    while t < end_t:
+    candidates: list[dict] = []
+    for t in sample_times:
         cap.set(cv2.CAP_PROP_POS_MSEC, t * 1000.0)
         ok, frame = cap.read()
-        if ok and frame is not None:
-            h, w = frame.shape[:2]
-            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-            faces = detector.detectMultiScale(gray, scaleFactor=1.15, minNeighbors=5,
-                                              minSize=(int(w * 0.10), int(h * 0.10)))
-            if len(faces):
-                fw, fh = max(faces, key=lambda r: r[2] * r[3])[2:4]
-                score = (fw * fh) / float(w * h)  # face's share of the frame
-                candidates.append({"time": round(t, 2), "score": round(score, 4)})
-        t += step
+        if not ok or frame is None:
+            continue
+        h, w = frame.shape[:2]
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        # minNeighbors 8 + larger minSize => only high-confidence close-up faces.
+        faces = detector.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=8,
+                                          minSize=(int(w * 0.14), int(h * 0.14)))
+        if len(faces):
+            fx0, fy0, fw, fh = max(faces, key=lambda r: r[2] * r[3])
+            score = (fw * fh) / float(w * h)  # face's share of the frame
+            if len(faces) == 1:               # prefer clean SINGLE-face frames
+                score *= 1.6
+            if score >= min_score:
+                candidates.append({
+                    "time": round(t, 2), "score": round(score, 4),
+                    "fx": round((fx0 + fw / 2) / w, 4),   # face centre, normalised
+                    "fy": round((fy0 + fh / 2) / h, 4),
+                    "faces": int(len(faces)),
+                })
 
     cap.release()
 
@@ -209,24 +227,15 @@ def build_outro_flashes(
 
 
 def _outro_durations(beats: list[float], body_duration: float, outro_seconds: float,
-                     n_shots: int, lo: float = 0.5, hi: float = 1.0) -> list[float]:
-    """Per-image hold times from the music beats, clamped to [lo, hi] seconds.
-
-    Uses the beat intervals inside the outro window so image changes land on the
-    beat, but never faster than `lo` (the old sub-0.5s flashes felt rushed) or
-    slower than `hi`.
+                     n_shots: int, lo: float = 0.8, hi: float = 1.6) -> list[float]:
+    """Hold time for each outro clip: spread `outro_seconds` across `n_shots`
+    evenly, clamped to [lo, hi]. Kept long enough that the clips aren't squished
+    (the earlier beat-synced version packed too many, too fast).
     """
-    win = [b for b in beats if body_duration < b < body_duration + outro_seconds]
-    bounds = [body_duration, *win, body_duration + outro_seconds]
-    durs = [max(lo, min(hi, bounds[i + 1] - bounds[i])) for i in range(len(bounds) - 1)]
-    durs = [d for d in durs if d >= lo * 0.6]
-    if not durs:  # no beats in window — even grid
-        n = max(1, int(outro_seconds / hi))
-        durs = [outro_seconds / n] * n
-    # Match the count to however many shots we have to show (cycle if needed).
-    if n_shots and len(durs) < n_shots:
-        durs = (durs * ((n_shots // len(durs)) + 1))[:n_shots]
-    return durs
+    if n_shots <= 0:
+        return []
+    per = max(lo, min(hi, outro_seconds / n_shots))
+    return [per] * n_shots
 
 
 def build_animated_outro(
@@ -241,6 +250,8 @@ def build_animated_outro(
     music_start: float = 0.0,
     music_volume: float = 0.18,
     fade: float = 0.28,
+    movie_name: str | None = None,
+    shot_faces: list | None = None,
 ) -> Path:
     """Build the animated outro: one enhanced face still per shot, each held for
     its beat-timed duration with a slow zoom-out + fade-in (Ken Burns), the
@@ -265,46 +276,56 @@ def build_animated_outro(
         vid_dur = float(_p.stdout.strip())
     except Exception:
         vid_dur = 0.0
+    # Pair each shot time with its face's horizontal centre (0..1), if known.
+    faces_in = shot_faces if (shot_faces and len(shot_faces) == len(shot_times)) else [None] * len(shot_times)
+    pairs = list(zip(shot_times, faces_in))
     if vid_dur > 2:
-        shot_times = [t for t in shot_times if 0 <= t <= vid_dur - 1.0]
+        pairs = [(t, fx) for t, fx in pairs if 0 <= t <= vid_dur - 1.0]
 
     with tempfile.TemporaryDirectory(prefix="outro-") as tmp:
         tmp_dir = Path(tmp)
         clips: list[Path] = []
-        for i, t in enumerate(shot_times):
+        for i, (t, fx) in enumerate(pairs):
             d = durations[i % len(durations)] if durations else 0.6
-            total = max(2, int(round(d * fps)))
-            still = tmp_dir / f"s{i:02d}.png"
             clip = tmp_dir / f"c{i:02d}.mp4"
-            # 1) grab + enhance the still — skip this shot if it fails rather than
-            # aborting the whole outro (and, upstream, the whole render).
+            # Frame a full-height PORTRAIT window centred on the face (so the face
+            # is centred and never cut off the sides); fall back to a centre crop.
+            if fx is not None:
+                cw = f"ih*{W}/{H}"
+                cover_i = (f"crop=w='{cw}':h=ih:"
+                           f"x='min(max(0\\,{fx}*iw-({cw})/2)\\,iw-({cw}))':y=0,scale={W}:{H}")
+            else:
+                cover_i = cover
+            # Use a short REAL clip of footage (not a still), slowed to fill the
+            # display duration `d` (so it's moving slow-motion), with a slow
+            # zoom-out (crop grows from 0.82 -> full over d) + fade-in. Skip a shot
+            # on failure rather than aborting the outro (or the whole render).
+            src_len = max(0.2, min(d, 0.55))     # footage grabbed; stretched to d
+            slow = max(1.0, d / src_len)          # >1 = slow motion
+            start = max(0.0, t - src_len / 2)
+            total = max(2, int(round(d * fps)))
+            # Speed RAMP fast->slow: setpts maps input time T via a convex power
+            # curve (p=1.8) so early frames are compressed (fast) and later frames
+            # spread out (slow) across the display duration `d`. fps fills the
+            # ramped frames, zoompan does the slow zoom-out. `-t` goes BEFORE `-i`
+            # (input duration) so setpts can stretch it past the source length.
+            vf = (f"{enh},{cover_i},setpts=({d:.3f}*pow(T/{src_len:.3f}\\,1.8))/TB,fps={fps},"
+                  f"zoompan=z='max(1.0,1.25-0.25*on/{total})':d=1:"
+                  f"x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':s={W}x{H}:fps={fps},"
+                  f"fade=t=in:st=0:d={fade},setsar=1,format=yuv420p")
             try:
                 subprocess.run(
-                    ["ffmpeg", "-y", "-ss", str(t), "-i", str(video_path), "-frames:v", "1",
-                     "-vf", f"{enh},{cover}", str(still)],
+                    ["ffmpeg", "-y", "-ss", f"{start:.3f}", "-t", f"{src_len:.3f}",
+                     "-i", str(video_path), "-an", "-vf", vf, "-c:v", "libx264",
+                     "-crf", "18", "-preset", "veryfast", "-pix_fmt", "yuv420p", str(clip)],
                     check=True, capture_output=True,
                 )
-                if not still.is_file() or still.stat().st_size == 0:
-                    raise RuntimeError("empty still")
+                if clip.is_file() and clip.stat().st_size > 0:
+                    clips.append(clip)
+                else:
+                    raise RuntimeError("empty clip")
             except Exception as exc:
                 print(f"      ! outro: skipping shot at {t:.0f}s ({exc})")
-                continue
-            # 2) animate: slow zoom-OUT (1.25x -> 1.0) + fade-in. Input framerate
-            # set so the loop yields exactly `total` frames; zoompan d=1 emits one
-            # output per input frame (d=total per frame explodes into a glitch).
-            zoom = (f"zoompan=z='max(1.0,1.25-0.25*on/{total})':d=1:"
-                    f"x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':s={W}x{H}:fps={fps},"
-                    f"fade=t=in:st=0:d={fade},setsar=1,format=yuv420p")
-            try:
-                subprocess.run(
-                    ["ffmpeg", "-y", "-loop", "1", "-framerate", str(fps), "-t", f"{d:.3f}",
-                     "-i", str(still), "-vf", zoom, "-c:v", "libx264", "-crf", "18",
-                     "-preset", "veryfast", "-pix_fmt", "yuv420p", str(clip)],
-                    check=True, capture_output=True,
-                )
-                clips.append(clip)
-            except Exception as exc:
-                print(f"      ! outro: animate failed for shot at {t:.0f}s ({exc})")
                 continue
 
         if not clips:
@@ -319,28 +340,86 @@ def build_animated_outro(
              "-c:v", "libx264", "-crf", "18", "-preset", "veryfast", "-pix_fmt", "yuv420p", str(silent)],
             check=True, capture_output=True,
         )
-        total_dur = sum((durations[i % len(durations)] if durations else 0.6)
-                        for i in range(len(clips)))
+        # Actual length of the concatenated clips (the speed-ramp makes each a bit
+        # longer than its target `d`, so the intended sum is wrong for the xfade).
+        try:
+            _sp = subprocess.run(["ffprobe", "-v", "error", "-show_entries",
+                                  "format=duration", "-of", "default=nw=1:nk=1", str(silent)],
+                                 capture_output=True, text=True, check=True)
+            total_dur = float(_sp.stdout.strip())
+        except Exception:
+            total_dur = sum((durations[i % len(durations)] if durations else 0.6)
+                            for i in range(len(clips)))
 
-        # 4) watermark on top + music underneath
-        vf = []
+        # 4) Titles (movie name top + MV EDITS bottom, black text with a white
+        #    glow, fading in), then an expanding-circle BLACKOUT to end on black.
+        # Pick a fancier font (first that exists): Cinzel/Trajan-like serifs read
+        # as "cinematic"; fall back through elegant Windows serifs to Arial Bold.
+        _font = next((n for n in ("Cinzel-Bold.ttf", "CinzelDecorative-Bold.ttf",
+                                  "PlayfairDisplay-Bold.ttf", "constanb.ttf", "georgiab.ttf",
+                                  "BOD_B.TTF", "impact.ttf", "arialbd.ttf")
+                      if (Path("C:/Windows/Fonts") / n).is_file()), None)
+        ff = f"fontfile='C\\:/Windows/Fonts/{_font}':" if _font else ""
+        fin = f"alpha='if(lt(t\\,0.5)\\,t/0.5\\,1)'"   # 0.5s fade-in
+
+        def _txt(text: str, y: str, fs: int, color: str) -> str:
+            safe = (text or "").replace("'", "").replace(":", " ").replace("\\", "")
+            return (f"drawtext={ff}text='{safe}':fontcolor={color}:fontsize={fs}:"
+                    f"x=(w-tw)/2:y={y}:{fin}")
+
+        # (text, y-expr, fontsize) for each title.
+        specs = []
+        if movie_name:
+            specs.append((movie_name, "110", 54))
         if watermark_text:
-            safe = watermark_text.replace("'", "").replace(":", "")
-            vf.append(f"drawtext=text='{safe}':fontsize=40:fontcolor=white@0.85:"
-                      f"x=(w-tw)/2:y=h-th-70:box=1:boxcolor=black@0.35:boxborderw=12")
-        vf_arg = ",".join(vf) if vf else "null"
+            specs.append((watermark_text, "h-th-170", 66))
+        white = ",".join(_txt(t, y, fs, "white") for t, y, fs in specs)
+        black = ",".join(_txt(t, y, fs, "black") for t, y, fs in specs)
 
+        # Blackout that radiates FROM the watermark (bottom-centre) with a SOFT,
+        # feathered edge (a glow-spread, not a hard-chopped circle): geq multiplies
+        # each pixel by a smooth 1->0 falloff over `fea` px at the growing radius.
+        import math
+        bd = 1.4
+        cx, cy = W // 2, H - 210
+        maxR = int(math.hypot(max(cx, W - cx), max(cy, H - cy))) + 80
+        fea = 130
+        new_total = total_dur + bd
+        R = f"{maxR}*clip((T-{total_dur:.3f})/{bd}\\,0\\,1)"
+        fexpr = f"clip(({R}-hypot(X-{cx}\\,Y-{cy}))/{fea}\\,0\\,1)"
+        geq = (f"format=gbrp,geq=r='r(X\\,Y)*(1-{fexpr})':"
+               f"g='g(X\\,Y)*(1-{fexpr})':b='b(X\\,Y)*(1-{fexpr})',format=yuv420p")
+
+        # Glow = white copy of the text blurred into a HALO (not a border), screen-
+        # blended onto the video, with the crisp black text drawn on top.
         cmd = ["ffmpeg", "-y", "-i", str(silent)]
+        if specs:
+            cmd += ["-f", "lavfi", "-i", f"color=black:s={W}x{H}:d={total_dur:.3f}:r={fps}"]
+            # Blend in RGB (gbrp), NOT yuv — screen-blending yuv chroma shifts the
+            # colours (that was the purple cast). Everything stays gbrp until the
+            # final format=yuv420p inside `geq`.
+            vchain = (f"[1:v]{white},gblur=sigma=9,format=gbrp[halo];"
+                      f"[0:v]fps={fps},setsar=1,format=gbrp[base];"
+                      f"[base][halo]blend=all_mode=screen[glowed];"
+                      f"[glowed]{black},tpad=stop_mode=clone:stop_duration={bd:.3f},{geq}[v]")
+            music_idx = 2
+        else:
+            vchain = (f"[0:v]fps={fps},setsar=1,"
+                      f"tpad=stop_mode=clone:stop_duration={bd:.3f},{geq}[v]")
+            music_idx = 1
+
         if music_path and Path(music_path).is_file():
             cmd += ["-ss", str(music_start), "-i", str(music_path),
                     "-filter_complex",
-                    f"[0:v]{vf_arg}[v];[1:a]atrim=0:{total_dur:.3f},asetpts=PTS-STARTPTS,"
-                    f"volume={music_volume},aresample=48000,aformat=channel_layouts=stereo[a]",
+                    vchain + f";[{music_idx}:a]atrim=0:{new_total:.3f},asetpts=PTS-STARTPTS,"
+                    f"volume={music_volume},aresample=48000,aformat=channel_layouts=stereo,"
+                    f"afade=t=out:st={new_total - 0.6:.3f}:d=0.6[a]",
                     "-map", "[v]", "-map", "[a]",
                     "-c:v", "libx264", "-crf", "18", "-preset", "veryfast",
-                    "-c:a", "aac", "-b:a", "192k", "-pix_fmt", "yuv420p", "-shortest", str(out_path)]
+                    "-c:a", "aac", "-b:a", "192k", "-pix_fmt", "yuv420p", str(out_path)]
         else:
-            cmd += ["-vf", vf_arg, "-c:v", "libx264", "-crf", "18", "-preset", "veryfast",
+            cmd += ["-filter_complex", vchain, "-map", "[v]",
+                    "-c:v", "libx264", "-crf", "18", "-preset", "veryfast",
                     "-pix_fmt", "yuv420p", str(out_path)]
         subprocess.run(cmd, check=True, capture_output=True)
 

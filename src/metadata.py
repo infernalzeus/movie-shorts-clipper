@@ -275,6 +275,9 @@ def build_edit_description(
     """
     title = (meta.get("title") or "").strip()
     tags = list(meta.get("tags") or [])
+    # The LLM's few-sentences blurb about the film — keep it (it's what makes the
+    # description informative), stripped of any hashtags the model may have added.
+    blurb = " ".join(w for w in (meta.get("description") or "").split() if not w.startswith("#")).strip()
 
     # Hashtags: movie name first, then the LLM tags, then evergreen edit tags.
     seed = ([movie_tag] if movie_tag else []) + tags + ["edit", "shorts", "fyp", "viral"]
@@ -289,6 +292,9 @@ def build_edit_description(
     lines: list[str] = []
     lines.append(f"{title}  #edit" if title else "#edit")
     lines.append("")
+    if blurb:                       # a few sentences about the film
+        lines.append(blurb)
+        lines.append("")
     if movie_label:
         lines.append(f"Movie: {movie_label}")
     if music:

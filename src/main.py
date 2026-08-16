@@ -177,7 +177,7 @@ def main() -> None:
                         help="Subtitle file for captions (default: auto-detected next to the movie; falls back to Whisper)")
     parser.add_argument("--no-srt", action="store_true",
                         help="Ignore any subtitle file and transcribe with Whisper instead")
-    parser.add_argument("--layout", choices=["square", "vertical"], default=None,
+    parser.add_argument("--layout", choices=["square", "vertical", "landscape"], default=None,
                         help="Frame layout (default: vertical when --narrate, else square)")
     parser.add_argument("--clip-dir", default=None,
                         help="Use this exact output dir (reuses its clip_raw.mp4 / thumbnail.jpg if present)")
@@ -343,6 +343,7 @@ def main() -> None:
     cut_ranges = ranges
     caption_ranges = ranges
     recap_shot_times: list[float] = []
+    recap_shot_faces: list = []
     recap_outro_durations: list[float] = []
     recap_body_duration = 0.0
     if is_recap:
@@ -382,8 +383,12 @@ def main() -> None:
         caption_ranges = snapped_body
         video_duration = get_duration(video_path)
 
+        recap_body_duration = sum(e - s for s, e in snapped_body)
+        cut_ranges = snapped_body  # the outro is a separate ANIMATED segment, not cut ranges
+
         shot_times: list[float] = []
-        if args.outro_shots:
+        shot_faces: list = []   # parallel face-centre (0..1) per shot, when known
+        if args.outro_shots:  # explicit hand-picked timestamps win
             for tok in re.split(r"[;,]", args.outro_shots):
                 tok = tok.strip()
                 if not tok:
@@ -392,22 +397,43 @@ def main() -> None:
                     shot_times.append(parse_timestamp(tok))
                 except ValueError:
                     print(f"      ! ignoring unparseable outro timestamp {tok!r}")
-        if not args.no_outro and args.auto_outro_shots > 0:
+        if not args.no_outro and not shot_times and snapped_body:
+            # Outro clips are high-confidence FACE shots found WITHIN the recap's
+            # own story beats — so they're both proper close-up faces and from the
+            # moments just shown. Fall back to the beats' centres if too few faces.
+            n = max(2, min(6, args.auto_outro_shots or 5, len(snapped_body)))
+            faces: list = []
             try:
-                found = find_iconic_shots(video_path, count=args.auto_outro_shots)
-                shot_times += [s["time"] for s in found]
-                print(f"      -> face-scan found {len(found)} iconic shot(s)")
+                faces = find_iconic_shots(video_path, count=n * 3, windows=snapped_body,
+                                          min_score=0.04, min_gap=1.5)
+                if len(faces) < n:  # too few in-story faces — top up from the back half
+                    more = find_iconic_shots(video_path, count=n * 3, region=(0.35, 0.98),
+                                             min_score=0.04, min_gap=1.5)
+                    for m in more:
+                        if all(abs(m["time"] - f["time"]) >= 1.5 for f in faces):
+                            faces.append(m)
             except Exception as exc:
-                print(f"      ! iconic-shot scan failed ({exc}); using hand-picked shots only")
+                print(f"      ! outro face-scan failed ({exc})")
+            if faces:
+                # ALL outro shots must be real faces — keep the strongest n, in
+                # chronological order, and carry each face's centre for framing.
+                best = sorted(sorted(faces, key=lambda f: -f["score"])[:n], key=lambda f: f["time"])
+                shot_times = [f["time"] for f in best]
+                shot_faces = [f.get("fx") for f in best]
+                print(f"      -> outro: {len(shot_times)} high-confidence face shot(s)")
+            else:
+                idxs = sorted({round(k * (len(snapped_body) - 1) / max(1, n - 1)) for k in range(n)})
+                shot_times = [(snapped_body[i][0] + snapped_body[i][1]) / 2 for i in idxs]
+                shot_faces = [None] * len(shot_times)
+                print("      -> outro: no confident faces found; using beat centres")
 
-        recap_body_duration = sum(e - s for s, e in snapped_body)
-        cut_ranges = snapped_body  # the outro is now a separate ANIMATED segment, not cut ranges
         if not args.no_outro and shot_times:
-            recap_shot_times = sorted(set(shot_times))
+            recap_shot_times = shot_times
+            recap_shot_faces = shot_faces if len(shot_faces) == len(shot_times) else []
             recap_outro_durations = _outro_durations(
                 beats, recap_body_duration, args.outro_seconds, len(recap_shot_times))
         print(f"      -> {len(beats)} beats | {len(snapped_body)} body clips snapped "
-              f"(~{recap_body_duration:.0f}s) | {len(recap_shot_times)} outro face still(s)")
+              f"(~{recap_body_duration:.0f}s) | {len(recap_shot_times)} outro slow-mo clip(s)")
 
     # Only reuse a prepared cut when it was cut from THIS video and THESE
     # ranges — otherwise re-cut. A stale reuse renders the old clip's video
@@ -436,7 +462,7 @@ def main() -> None:
         print(f"      -> {raw_clip_path}")
     else:
         step(f"Cutting {len(cut_ranges)} range(s) from source video...")
-        cut_and_concat(video_path, cut_ranges, raw_clip_path)
+        cut_and_concat(video_path, cut_ranges, raw_clip_path, fade_edges=is_recap)
         print(f"      -> {raw_clip_path}")
     clip_duration = get_duration(raw_clip_path)
 
@@ -474,6 +500,13 @@ def main() -> None:
                       f"scale={frame_w}:{frame_w}:flags=lanczos,"
                       f"pad={frame_w}:{frame_h}:0:{video_top}:black")
         frame_size = (frame_w, frame_h)
+    elif layout_mode == "landscape":
+        # 16:9 1080p, no crop — keep the original framing, letterbox if the source
+        # isn't 16:9. This is the long-form / narrative shape.
+        fw, fh = 1920, 1080
+        pre_filter = (f"scale={fw}:{fh}:force_original_aspect_ratio=decrease:flags=lanczos,"
+                      f"pad={fw}:{fh}:(ow-iw)/2:(oh-ih)/2:black")
+        frame_size = (fw, fh)
     else:
         pre_filter = (f"crop=min(iw\\,ih):min(iw\\,ih),"
                       f"scale={args.size}:{args.size}:flags=lanczos")
@@ -638,9 +671,10 @@ def main() -> None:
                 body_fps = 30
             build_animated_outro(
                 video_path, recap_shot_times, recap_outro_durations, outro_path,
-                size=frame_size, fps=body_fps, watermark_text=watermark_text,
+                size=frame_size, fps=body_fps,
+                watermark_text=(watermark_text or "MV EDITS"), movie_name=movie_label,
                 music_path=bg_music_path, music_start=recap_body_duration,
-                music_volume=args.bg_volume,
+                music_volume=args.bg_volume, shot_faces=recap_shot_faces,
             )
             # Use the concat FILTER, not the demuxer: the demuxer silently DROPS
             # frames when the two files' framerates differ even slightly (body
