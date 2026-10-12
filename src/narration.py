@@ -13,8 +13,10 @@ from dataclasses import dataclass
 
 import requests
 
-from metadata import FALLBACK_MODEL, OLLAMA_URL, fetch_movie_context
+from jsonsalvage import loads_lenient
+from metadata import FALLBACK_MODEL, OLLAMA_URL, _fit_num_ctx, fetch_movie_context
 from subtitles import Cue
+from editorial import text_issues
 
 # Rough speaking rate of the edge-tts neural voices at default rate.
 _WORDS_PER_SECOND = 2.4
@@ -78,7 +80,7 @@ def _call_ollama(model: str, prompt: str) -> str:
             "format": "json",
             "stream": False,
             # Roomy enough for the surrounding-scene context blocks.
-            "options": {"num_ctx": 16384},
+            "options": {"num_ctx": _fit_num_ctx(prompt)},
         },
         timeout=300,
     )
@@ -205,10 +207,11 @@ def generate_narration_beats(
         print(f"      ! {model} unavailable ({type(exc).__name__}), falling back to {FALLBACK_MODEL}")
         raw = _call_ollama(FALLBACK_MODEL, prompt)
 
-    try:
-        parsed = json.loads(raw).get("beats", [])
-    except json.JSONDecodeError as exc:
-        raise ValueError(f"Ollama did not return valid JSON for narration: {raw!r}") from exc
+    # Beats map back by index, so a partial list just means some beats keep the
+    # dialogue-derived fallback text rather than losing the whole narration.
+    parsed = loads_lenient(raw, "beats")
+    if not parsed:
+        raise ValueError(f"Ollama returned no usable narration beats: {raw[:400]!r}")
 
     # Map the LLM's lines back onto our beats by 1-based index.
     by_index: dict[int, str] = {}
@@ -227,6 +230,9 @@ def generate_narration_beats(
         if not text:
             continue
         beat.text = _fit_line(text, beat.max_words)
+        problems = text_issues(beat.text)
+        if problems:
+            raise ValueError("Narration needs review before rendering: " + "; ".join(problems))
         out.append(beat)
 
     if not out:

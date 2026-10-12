@@ -1,0 +1,10 @@
+{
+  "_comment": "Copy this to brand.json and fill it in. brand.json is gitignored so your channel identity stays local. avatar_path is the canonical name; any avatar.* image in that folder is found automatically. No image is required.",
+  "display_name": "Your Channel Name",
+  "handle": "@yourhandle",
+  "watermark_text": "YOUR MARK",
+  "accent_colour": "#7C5CFC",
+  "secondary_colour": "#151525",
+  "avatar_path": "assets/brand/avatar.png",
+  "subscribe_prompt": "Subscribe"
+}

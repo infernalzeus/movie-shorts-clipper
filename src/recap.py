@@ -23,14 +23,14 @@ import requests
 
 from clip_selector import parse_timestamp
 from metadata import DEFAULT_MODEL, FALLBACK_MODEL, fetch_movie_context
-from scenes import _call_ollama, _condense, _fmt_ts, _snap_to_cues
+from scenes import _call_ollama, _condense, _fmt_ts_precise, _loads_lenient, _snap_to_cues
 from subtitles import parse_srt
 
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
 # Recap beats are short — a beat is a single moment, not a whole scene.
-_MIN_BEAT = 2.5    # allow short/shortest punchy lines too, as long as they're complete
+_MIN_BEAT = 4.0    # meaty, connected beats — not a stream of tiny disconnected snippets
 _MAX_BEAT = 10.0
 _DEFAULT_TARGET = 120.0   # total body seconds to aim for (before the outro)
 
@@ -107,10 +107,10 @@ def suggest_recap(
         f"No background found. Use general knowledge about '{title}'."
     )
 
-    # Aim a little high on the beat count — validation drops some, and we trim
-    # to the duration budget at the end anyway.
-    avg_beat = (min_beat + max_beat) / 2   # ~7.5s
-    count = max(4, min(20, round(target_seconds / avg_beat) + 2))
+    # Ask for slightly FEWER than the budget: snapping + the tail pad grow each
+    # beat, and the outro is separate, so over-asking overshot the target length.
+    avg_beat = (min_beat + max_beat) / 2   # ~7s
+    count = max(3, min(16, round(target_seconds * 0.9 / avg_beat)))
 
     prompt = _PROMPT_TEMPLATE.format(
         source_title=title,
@@ -129,10 +129,12 @@ def suggest_recap(
         print(f"! {model} unavailable ({type(exc).__name__}), falling back to {FALLBACK_MODEL}", file=sys.stderr)
         raw = _call_ollama(FALLBACK_MODEL, prompt)
 
-    try:
-        beats_raw = json.loads(raw).get("beats", [])
-    except json.JSONDecodeError as exc:
-        raise ValueError(f"Ollama did not return valid JSON: {raw!r}") from exc
+    # Lenient: asked for a long beat list on a feature film, a small local model
+    # often writes a dozen good beats and then degenerates without closing the
+    # JSON. Keep the complete ones instead of discarding the whole response.
+    beats_raw = _loads_lenient(raw, "beats")
+    if not beats_raw:
+        raise ValueError(f"Ollama returned no usable beats: {raw[:400]!r}")
 
     movie_end = cues[-1].end
     beats: list[dict] = []
@@ -168,13 +170,13 @@ def suggest_recap(
         beats.append({
             "start": round(start, 1),
             "end": round(end, 1),
-            "range": f"{_fmt_ts(start)}-{_fmt_ts(end)}",
+            "range": f"{_fmt_ts_precise(start)}-{_fmt_ts_precise(end)}",
             "title": str(item.get("title", "")).strip(),
             "reason": str(item.get("reason", "")).strip(),
         })
         prev_end = end
         total += end - start
-        if total >= target_seconds:
+        if total >= target_seconds * 0.9:   # leave headroom for snap/tail growth
             break
 
     # Fallback: the LLM returned nothing usable (common with a small local model
@@ -193,7 +195,7 @@ def suggest_recap(
             beats.append({
                 "start": round(s, 1),
                 "end": round(e, 1),
-                "range": f"{_fmt_ts(s)}-{_fmt_ts(e)}",
+                "range": f"{_fmt_ts_precise(s)}-{_fmt_ts_precise(e)}",
                 "title": (c.text or "").strip()[:48],
                 "reason": "auto (SRT timing)",
             })

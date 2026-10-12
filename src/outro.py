@@ -24,6 +24,154 @@ import json
 import sys
 from pathlib import Path
 
+
+_BRAND_DIR = Path(__file__).resolve().parents[1] / "assets" / "brand"
+# brand.json carries the channel's real identity and is gitignored. The committed
+# brand.example.json keeps a fresh clone working instead of crashing on a missing
+# file — copy it to brand.json and fill it in.
+BRAND_PATH = (_BRAND_DIR / "brand.json" if (_BRAND_DIR / "brand.json").is_file()
+              else _BRAND_DIR / "brand.example.json")
+
+
+def load_brand(path: Path = BRAND_PATH) -> dict:
+    """Load shared identity; absent artwork is optional, invalid settings are not."""
+    import re
+    brand = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(brand, dict):
+        raise ValueError("brand.json must contain an object")
+    for key in ("display_name", "handle", "watermark_text", "subscribe_prompt"):
+        if not isinstance(brand.get(key), str) or not brand[key].strip():
+            raise ValueError(f"brand.json needs non-empty {key}")
+    for key in ("accent_colour", "secondary_colour"):
+        if not re.fullmatch(r"#[0-9a-fA-F]{6}", str(brand.get(key, ""))):
+            raise ValueError(f"brand.json {key} must be #RRGGBB")
+    avatar = brand.get("avatar_path") or "assets/brand/avatar.png"
+    avatar = Path(avatar)
+    if not avatar.is_absolute():
+        avatar = path.resolve().parents[2] / avatar
+    # Be forgiving about the extension. Windows hides known extensions, so
+    # "rename this to avatar.png" routinely produces avatar.png.jpg — which is
+    # still a perfectly good image. Match any avatar.* alongside the configured
+    # name rather than silently rendering a card with no face on it.
+    if not avatar.is_file():
+        found = sorted(
+            p for p in avatar.parent.glob(f"{avatar.stem.split('.')[0]}.*")
+            if p.suffix.lower() in (".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif")
+        )
+        if found:
+            print(f"      -> brand avatar: using {found[0].name} ({avatar.name} not found)")
+            avatar = found[0]
+    brand["avatar_path"] = str(avatar)
+    return brand
+
+
+def build_brand_end_card(out_path: Path, *, size=(1080, 1920), duration=2.0,
+                         fps="30", brand=None) -> Path:
+    """Short animated identity card, with silent audio for every concat path."""
+    import subprocess
+    import tempfile
+    import math
+    if not math.isfinite(duration) or not 1.5 <= duration <= 2.5:
+        raise ValueError("End-card duration must be between 1.5 and 2.5 seconds")
+    brand = brand or load_brand()
+    width, height = size
+    scale = min(width, height)
+    avatar = Path(brand["avatar_path"])
+    # 9:16 is nearly twice as tall as it is wide, so fractions tuned on a square
+    # strand the avatar in the top third and leave both ends empty. On a tall
+    # frame, group the block around the centre and give the avatar more of the
+    # width — this is the Shorts shape, so it is the one that has to land.
+    tall = height > width * 1.3
+    avatar_frac = .30 if tall else .20
+    avatar_y, name_y, handle_y, sub_y = (
+        (.37, .52, .585, .675) if tall else (.29, .46, .55, .65))
+
+    def escape(path):
+        return path.resolve().as_posix().replace("\\", "\\\\").replace(":", "\\:").replace("'", "\\'")
+
+    with tempfile.TemporaryDirectory(prefix="brand-card-") as folder:
+        root = Path(folder)
+        texts = []
+        for i, (key, y, factor, colour) in enumerate([
+            ("display_name", name_y, .064, "white"),
+            ("handle", handle_y, .041, "white"),
+            ("subscribe_prompt", sub_y, .058, brand["accent_colour"]),
+        ]):
+            text = brand[key]
+            textfile = root / f"text-{i}.txt"
+            textfile.write_text(text, encoding="utf-8")
+            font = max(12, int(min(scale * factor, width * .82 / max(1, len(text) * .65))))
+            fontfile = Path("C:/Windows/Fonts/arialbd.ttf")
+            font_option = f"fontfile='{escape(fontfile)}':" if fontfile.is_file() else ""
+            texts.append(f"drawtext={font_option}textfile='{escape(textfile)}':expansion=none:"
+                         f"fontsize={font}:fontcolor={colour}:x=(w-tw)/2:y=h*{y}-th/2")
+
+        def render(with_avatar):
+            command = ["ffmpeg", "-y", "-f", "lavfi", "-i",
+                       f"color=c={brand['secondary_colour']}:s={width}x{height}:r={fps}:d={duration}",
+                       "-f", "lavfi", "-i", "anullsrc=r=48000:cl=stereo"]
+            graph = f"[0:v]drawbox=x=0:y=0:w=iw:h={max(4, int(scale*.009))}:color={brand['accent_colour']}:t=fill[base];"
+            if with_avatar:
+                command += ["-loop", "1", "-i", str(avatar)]
+                side = int(scale * avatar_frac) // 2 * 2
+                # Cover, don't letterbox: a channel avatar is square, and most
+                # source images are not. `decrease` + pad would frame a portrait
+                # photo inside bars; `increase` + crop fills the square the way
+                # YouTube itself crops an avatar.
+                graph += (f"[2:v]scale={side}:{side}:force_original_aspect_ratio=increase,"
+                          f"crop={side}:{side},setsar=1[avatar];"
+                          f"[base][avatar]overlay=x=(W-w)/2:y=H*{avatar_y}-h/2:shortest=1[identity];")
+                base = "identity"
+            else:
+                base = "base"
+            graph += (f"[{base}]" + ",".join(texts) +
+                      f",fade=t=in:d=0.12,fade=t=out:st={duration-.12}:d=0.12,format=yuv420p[v]")
+            command += ["-filter_complex", graph, "-map", "[v]", "-map", "1:a",
+                        "-t", str(duration), "-c:v", "libx264", "-preset", "veryfast", "-crf", "18",
+                        "-c:a", "aac", "-b:a", "192k", "-ar", "48000", str(out_path)]
+            subprocess.run(command, check=True, capture_output=True)
+
+        if not avatar.is_file():
+            # Say so. A configured-but-missing avatar used to produce a text-only
+            # card with no warning, so the card looked "done" while the channel's
+            # face was never on it.
+            print(f"      ! No brand avatar at {avatar} — rendering the text-only card")
+        try:
+            render(avatar.is_file())
+        except subprocess.CalledProcessError:
+            if not avatar.is_file():
+                raise
+            print("      ! Avatar could not be rendered; using the text-only brand card")
+            render(False)
+    return out_path
+
+
+def append_end_card(video_path: Path, card_path: Path, *, duration: float) -> None:
+    """Append at the body's frame rate; cap padded AAC tails to video timelines."""
+    import subprocess
+    from ffutil import get_duration, get_resolution
+    width, height = get_resolution(video_path)
+    probe = subprocess.run(["ffprobe", "-v", "error", "-select_streams", "v:0",
+                            "-show_entries", "stream=avg_frame_rate,duration", "-of", "json", str(video_path)],
+                           capture_output=True, text=True, check=True)
+    stream = json.loads(probe.stdout)["streams"][0]
+    fps = stream["avg_frame_rate"]
+    if fps == "0/0":
+        fps = "30"
+    body_duration = float(stream.get("duration") or get_duration(video_path))
+    merged = video_path.with_name("brand-merged.mp4")
+    graph = (f"[0:v]fps={fps},scale={width}:{height},setsar=1,setpts=PTS-STARTPTS[v0];"
+             f"[1:v]fps={fps},scale={width}:{height},setsar=1,setpts=PTS-STARTPTS[v1];"
+             f"[0:a]aresample=48000,aformat=channel_layouts=stereo,apad,atrim=duration={body_duration},asetpts=PTS-STARTPTS[a0];"
+             f"[1:a]aresample=48000,aformat=channel_layouts=stereo,apad,atrim=duration={duration},asetpts=PTS-STARTPTS[a1];"
+             "[v0][a0][v1][a1]concat=n=2:v=1:a=1[v][a]")
+    subprocess.run(["ffmpeg", "-y", "-i", str(video_path), "-i", str(card_path),
+                    "-filter_complex", graph, "-map", "[v]", "-map", "[a]",
+                    "-t", str(body_duration + duration), "-c:v", "libx264", "-preset", "veryfast",
+                    "-crf", "18", "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "192k", str(merged)],
+                   check=True, capture_output=True)
+    merged.replace(video_path)
+
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
@@ -418,9 +566,15 @@ def build_animated_outro(
                     "-c:v", "libx264", "-crf", "18", "-preset", "veryfast",
                     "-c:a", "aac", "-b:a", "192k", "-pix_fmt", "yuv420p", str(out_path)]
         else:
-            cmd += ["-filter_complex", vchain, "-map", "[v]",
+            # No music, but still emit a SILENT audio track. The recap append
+            # concatenates [0:a][1:a]; a video-only outro makes that filtergraph
+            # fail outright and the edit quietly loses its outro.
+            cmd += ["-f", "lavfi", "-t", f"{new_total:.3f}",
+                    "-i", "anullsrc=r=48000:cl=stereo",
+                    "-filter_complex", vchain,
+                    "-map", "[v]", "-map", f"{music_idx}:a",
                     "-c:v", "libx264", "-crf", "18", "-preset", "veryfast",
-                    "-pix_fmt", "yuv420p", str(out_path)]
+                    "-c:a", "aac", "-b:a", "192k", "-pix_fmt", "yuv420p", str(out_path)]
         subprocess.run(cmd, check=True, capture_output=True)
 
     return out_path

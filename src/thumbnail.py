@@ -249,7 +249,7 @@ def make_thumbnail(
             return min(base, int(width * 0.90 / (0.74 * max(longest, 1))))
 
         if title:
-            wrapped_title = _wrap(title.upper(), width=20, max_lines=3)
+            wrapped_title = _wrap(title, width=20, max_lines=3)   # respect the typed case (no auto-uppercase)
             tf = tmp_dir / "title.txt"
             tf.write_text(wrapped_title, encoding="utf-8")
             # Smaller than the movie name — this is the hook line, not the headline.
@@ -273,7 +273,7 @@ def make_thumbnail(
             else:
                 movie_main, movie_sub = movie.strip(), ""
 
-            wrapped_main = _wrap(movie_main.upper(), width=16, max_lines=2)
+            wrapped_main = _wrap(movie_main, width=16, max_lines=2)   # respect typed case
             mf = tmp_dir / "movie.txt"
             mf.write_text(wrapped_main, encoding="utf-8")
             main_size = _fit_size(wrapped_main, max(84, width // 9))
@@ -282,7 +282,7 @@ def make_thumbnail(
             if movie_sub:
                 sub_size = max(38, width // 26)
                 sf = tmp_dir / "movie_sub.txt"
-                sf.write_text(movie_sub.upper(), encoding="utf-8")
+                sf.write_text(movie_sub, encoding="utf-8")
                 steps.append(
                     f"drawtext=textfile='{_escape_filter_path(sf)}'{font_arg}"
                     f":fontcolor={text_color}:fontsize={sub_size}"
@@ -357,6 +357,10 @@ def main() -> None:
     parser.add_argument("--sharpness", type=float, default=None,
                         help="Override the preset's sharpening (0.0–2.0, 0 = off)")
     parser.add_argument("--pan", type=float, default=0.5, help="Horizontal crop position 0.0–1.0 (default 0.5)")
+    parser.add_argument("--width", type=int, default=1080,
+                        help="Thumbnail width in px (default 1080; 1920 for a 16:9 long-form thumbnail)")
+    parser.add_argument("--height", type=int, default=1920,
+                        help="Thumbnail height in px (default 1920; 1080 for a 16:9 long-form thumbnail)")
     parser.add_argument("--title", default=None, help="Title text (overlaid top)")
     parser.add_argument("--movie", default=None, help="Movie name (overlaid bottom)")
     args = parser.parse_args()
@@ -377,6 +381,7 @@ def main() -> None:
 
     out = make_thumbnail(src, Path(args.out), title=args.title, movie=args.movie,
                          at=args.at, pan=args.pan, image=image,
+                         width=args.width, height=args.height,
                          font=args.font, color=args.color, match_image=match_image,
                          enhance=args.enhance, brightness=args.brightness,
                          contrast=args.contrast, saturation=args.saturation,

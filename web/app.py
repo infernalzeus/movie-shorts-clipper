@@ -43,6 +43,7 @@ STEP_RE = re.compile(r"^\[(\d+)/(\d+)\]\s*(.*)$")
 
 SCENES_SCRIPT = SRC_DIR / "scenes.py"
 RECAP_SCRIPT = SRC_DIR / "recap.py"
+EDITORIAL_SCRIPT = SRC_DIR / "editorial.py"
 THUMBNAIL_SCRIPT = SRC_DIR / "thumbnail.py"
 METADATA_SCRIPT = SRC_DIR / "metadata.py"
 
@@ -78,7 +79,11 @@ def _spawn_ollama() -> str | None:
     if sys.platform == "win32":
         flags = subprocess.CREATE_NO_WINDOW | subprocess.CREATE_NEW_PROCESS_GROUP
         app_exe = Path(os.environ.get("LOCALAPPDATA", "")) / "Programs" / "Ollama" / "ollama app.exe"
-        if app_exe.is_file():
+        try:
+            desktop_available = app_exe.is_file()
+        except OSError:
+            desktop_available = False
+        if desktop_available:
             try:
                 subprocess.Popen(
                     [str(app_exe)],
@@ -372,7 +377,18 @@ async def probe_video(request: web.Request) -> web.Response:
     if not path or not path.is_file():
         return web.json_response({"exists": False, "srt": None})
     srt = _find_srt_for_video(path)
-    return web.json_response({"exists": True, "srt": str(srt) if srt else None})
+    # Runtime (seconds) so the UI can bound the "summarize this span" slider.
+    duration = None
+    try:
+        r = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+             "-of", "default=nw=1:nk=1", str(path)],
+            capture_output=True, text=True, timeout=20,
+        )
+        duration = round(float(r.stdout.strip()), 1)
+    except Exception:
+        duration = None
+    return web.json_response({"exists": True, "srt": str(srt) if srt else None, "duration": duration})
 
 
 _suggest_lock = asyncio.Lock()
@@ -392,6 +408,14 @@ async def suggest_scenes(request: web.Request) -> web.Response:
     if data.get("model"):
         args += ["--model", str(data["model"])]
     args += ["--count", str(int(data.get("count") or 5))]
+    # Scene length is shape-driven now: a 9:16 Short wants 20-60s, a 16:9
+    # long-form video wants minutes. The client sends the window it wants.
+    for key, flag in (("min_seconds", "--min-seconds"), ("max_seconds", "--max-seconds")):
+        if data.get(key) is not None:
+            try:
+                args += [flag, f"{float(data[key]):g}"]
+            except (TypeError, ValueError):
+                raise web.HTTPBadRequest(text=f"Invalid {key}")
 
     if _suggest_lock.locked():
         raise web.HTTPConflict(text="A scene suggestion is already running")
@@ -644,6 +668,13 @@ async def make_thumbnail_route(request: web.Request) -> web.Response:
             args += ["--pan", f"{min(1.0, max(0.0, float(pan))):.4f}"]
         except (TypeError, ValueError):
             raise web.HTTPBadRequest(text="Invalid pan")
+    # Canvas size follows the output shape — a 16:9 long-form upload needs a
+    # 1920x1080 thumbnail, not the tall Shorts one.
+    if data.get("width") and data.get("height"):
+        try:
+            args += ["--width", str(int(data["width"])), "--height", str(int(data["height"]))]
+        except (TypeError, ValueError):
+            raise web.HTTPBadRequest(text="Invalid thumbnail size")
     if data.get("title"):
         args += ["--title", str(data["title"])]
     if data.get("movie"):
@@ -710,6 +741,26 @@ async def prepare(request: web.Request) -> web.Response:
     args = [sys.executable, str(MAIN_SCRIPT), "--video", video, "--ranges", ranges, "--prepare-only"]
     if data.get("source_title"):
         args += ["--source-title", str(data["source_title"])]
+    # Phase 1 owns the cut, so it must snap boundaries the SAME way phase 2 will —
+    # pass the toggle through or a snapped prepared cut won't match the captions.
+    if data.get("no_snap_speech"):
+        args += ["--no-snap-speech"]
+    # Recap cuts its body on the music's beats, so phase 1 has to know the mode
+    # and the track — a prepared cut that ignored them would be re-cut in phase 2
+    # and take the hand-picked thumbnail down with it.
+    if (data.get("selection") or "") == "spine" or (data.get("mode") or "") == "recap":
+        args += ["--selection", "spine", "--voice", str(data.get("voice") or "music")]
+        if data.get("srt") and Path(str(data["srt"])).is_file():
+            args += ["--srt", str(data["srt"])]
+        bg_mode = data.get("bg_mode") or "none"
+        if bg_mode == "none":
+            args += ["--no-bg-music"]
+        elif bg_mode == "file" and data.get("bg_music"):
+            bg_path = AUDIO_DIR / str(data["bg_music"])
+            if bg_path.is_file():
+                args += ["--bg-music", str(bg_path)]
+        # bg_mode == "random" falls through: main.py rolls the track, prints it,
+        # and we hand it back so phase 2 renders against that exact one.
 
     if _prepare_lock.locked():
         raise web.HTTPConflict(text="Already preparing a clip")
@@ -736,12 +787,14 @@ async def prepare(request: web.Request) -> web.Response:
     if proc.returncode != 0:
         raise web.HTTPInternalServerError(text=f"prepare failed:\n{out[-800:]}")
 
-    clip_dir = raw_clip = movie = None
+    clip_dir = raw_clip = movie = recap_music = None
     for line in out.splitlines():
         if "Clip dir:" in line:
             clip_dir = line.split("Clip dir:")[-1].strip()
         elif "Raw clip:" in line:
             raw_clip = line.split("Raw clip:")[-1].strip()
+        elif "Recap music:" in line:
+            recap_music = line.split("Recap music:")[-1].strip()
         elif "Movie:" in line:
             movie = line.split("Movie:")[-1].strip()
     if not clip_dir or not raw_clip:
@@ -763,6 +816,9 @@ async def prepare(request: web.Request) -> web.Response:
         "clip_dir": clip_dir,
         "raw_clip_url": _prepared["raw_clip_url"],
         "movie": movie or "",
+        # Recap only: the track phase 1 actually snapped the cut to. The client
+        # pins it so a "random" pick does not change between the two phases.
+        "recap_music": Path(recap_music).name if recap_music else "",
     })
 
 
@@ -773,17 +829,88 @@ def _expected_steps(args: list[str]) -> int:
     passed, so the UI draws the right number of segments from the first paint
     instead of jumping when the real total arrives on the '[1/N]' line.
     """
-    is_recap = "--mode" in args and "recap" in args
+    def _flag(name: str):
+        return args[args.index(name) + 1] if name in args else None
+    selection = _flag("--selection") or "manual"
+    voice = _flag("--voice") or "none"
+    is_recap = selection == "spine"
+    narration_led = voice == "storytelling"
+    auto_ranges = selection in ("spine", "script")
     return (5
             + (2 if is_recap else 0)                            # recap: analysis + animated outro
-            + (1 if ("--remove-silence" in args and not is_recap) else 0)
-            + (2 if "--narrate" in args else 0)                 # narration beats + voiceover
-            + (1 if ("--narrate" in args or "--prepend-thumbnail" in args or is_recap) else 0)  # thumbnail
+            - (1 if (is_recap and "--no-outro" in args) else 0)  # ...minus the outro when it is off
+            + (2 if narration_led else 0)                       # write the script + speak it
+            + (1 if (selection == "scene" and "--ranges" not in args) else 0)
+            + (1 if ("--remove-silence" in args and not auto_ranges) else 0)
+            + (2 if voice == "commentary" else 0)               # narration beats + voiceover
+            + (0 if "--no-thumbnail" in args else
+               (1 if (voice == "commentary" or "--prepend-thumbnail" in args or auto_ranges)
+                else 0))                                        # thumbnail
             + (1 if "--prepend-thumbnail" in args else 0))      # bake thumbnail into video
+
+
+@routes.post("/comparison-plan")
+async def comparison_plan(request: web.Request) -> web.Response:
+    """Generate and review one shared story before either expensive render."""
+    if (run_state.proc is not None and run_state.proc.returncode is None) or request.app.get("comparison_busy"):
+        raise web.HTTPConflict(text="Wait for the current job to finish")
+    data = await request.json()
+    video = Path(_clean_path(data.get("video")))
+    srt = _find_srt_for_video(video)
+    if not video.is_file() or not srt:
+        raise web.HTTPBadRequest(text="Choose a movie with subtitles")
+    try:
+        start, end = float(data["span_start"]), float(data["span_end"])
+        duration = float(data.get("target_seconds", 60))
+    except (KeyError, ValueError, TypeError):
+        raise web.HTTPBadRequest(text="Enable a source window and choose its bounds")
+    err = await _ensure_ollama()
+    if err:
+        raise web.HTTPServiceUnavailable(text=err)
+    folder = OUTPUT_DIR / ("comparison-" + uuid.uuid4().hex[:8])
+    args = [sys.executable, str(EDITORIAL_SCRIPT), "--video", str(video), "--srt", str(srt),
+            "--title", str(data.get("source_title") or video.stem),
+            "--model", str(data.get("ollama_model") or "nemotron-3-super:cloud"),
+            "--start", str(start), "--end", str(end), "--duration", str(duration), "--folder", str(folder),
+            "--feedback", str(data.get("editorial_feedback") or "")[:3000]]
+    request.app["comparison_busy"] = True
+    jobs = request.app.setdefault("comparison_jobs", {})
+    job_id = uuid.uuid4().hex
+    jobs[job_id] = {"status": "running"}
+    async def work():
+        proc = None
+        try:
+            proc = await asyncio.create_subprocess_exec(*args, cwd=str(PROJECT_ROOT),
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=660)
+            if proc.returncode:
+                raise ValueError(stderr.decode(errors="replace")[-2000:])
+            plan = json.loads(stdout.decode())
+            for beat in plan["beats"]:
+                beat["previews"] = [_rel_output_url(p) for p in beat["previews"]]
+            jobs[job_id] = {"status": "complete", "plan": plan}
+        except Exception as exc:
+            jobs[job_id] = {"status": "failed", "error": str(exc) or "Plan generation timed out"}
+        finally:
+            if proc is not None and proc.returncode is None:
+                await _kill_tree(proc)
+            request.app["comparison_busy"] = False
+    request.app.setdefault("comparison_tasks", set()).add(asyncio.create_task(work()))
+    return web.json_response({"job_id": job_id}, status=202)
+
+
+@routes.get("/comparison-plan/{job_id}")
+async def comparison_status(request: web.Request) -> web.Response:
+    job = request.app.get("comparison_jobs", {}).get(request.match_info["job_id"])
+    if job is None:
+        raise web.HTTPNotFound(text="Plan job no longer exists; rebuild after an app restart")
+    return web.json_response(job)
 
 
 @routes.post("/run")
 async def start_run(request: web.Request) -> web.Response:
+    if request.app.get("comparison_busy"):
+        raise web.HTTPConflict(text="An editorial plan is still being generated")
     if run_state.proc is not None and run_state.proc.returncode is None:
         raise web.HTTPConflict(text="A clip is already running")
 
@@ -792,11 +919,30 @@ async def start_run(request: web.Request) -> web.Response:
     video = _clean_path(data.get("video"))
     ranges = (data.get("ranges") or "").strip()
     mode = data.get("mode") or ("narrated" if data.get("narrate") else "classic")
+    # The axes are authoritative; `mode` is only the preset label the UI showed.
+    _PRESET_AXES = {
+        "classic":      ("manual", "none"),
+        "narrated":     ("manual", "commentary"),
+        "recap":        ("spine",  "music"),
+        "storytelling": ("script", "storytelling"),
+    }
+    _def_sel, _def_voice = _PRESET_AXES.get(mode, ("manual", "none"))
+    selection = data.get("selection") or _def_sel
+    voice = data.get("voice") or _def_voice
+    if selection not in ("manual", "scene", "spine", "script"):
+        raise web.HTTPBadRequest(text=f"Unknown selection: {selection}")
+    if voice not in ("none", "commentary", "storytelling", "music"):
+        raise web.HTTPBadRequest(text=f"Unknown voice: {voice}")
+    if (voice == "storytelling") != (selection == "script"):
+        raise web.HTTPBadRequest(text="Storytelling voice and script selection must be chosen together.")
+    if (data.get("editorial_file") or "").strip() and voice not in ("commentary", "storytelling"):
+        raise web.HTTPBadRequest(text="Approved editorial requires commentary or storytelling voice.")
+    auto_ranges = selection in ("spine", "script", "scene")
     if not video or not Path(video).is_file():
         raise web.HTTPBadRequest(text="Video file not found")
     # Recap can auto-build its ranges from the whole subtitle file, so it may
     # legitimately arrive with none; every other mode needs at least one.
-    if not ranges and mode != "recap":
+    if not ranges and not auto_ranges:
         raise web.HTTPBadRequest(text="At least one range is required")
 
     args = ["--video", video]
@@ -811,23 +957,55 @@ async def start_run(request: web.Request) -> web.Response:
     args += ["--whisper-model", data.get("whisper_model") or "medium"]
     args += ["--ollama-model", data.get("ollama_model") or "nemotron-3-super:cloud"]
     args += ["--language", data.get("language") or "en"]
+    if (data.get("editorial_file") or "").strip():
+        args += ["--editorial-file", _clean_path(data["editorial_file"])]
+    if data.get("comparison_style"):
+        if not data.get("visual_reviewed"):
+            raise web.HTTPBadRequest(text="Review the character evidence and frame previews first")
+        # Resolve only a plan produced by this app, never a client-supplied output path.
+        editorial_path = Path(_clean_path(data.get("editorial_file"))).resolve()
+        if OUTPUT_DIR.resolve() not in editorial_path.parents or editorial_path.name != "editorial.json":
+            raise web.HTTPBadRequest(text="Comparison plan is outside Movie Clipper output")
+        try:
+            reviewed = json.loads(editorial_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            raise web.HTTPBadRequest(text="Comparison plan no longer exists")
+        if reviewed.get("comparison_style") != data["comparison_style"]:
+            raise web.HTTPBadRequest(text="Comparison style does not match its plan")
+        args += ["--clip-dir", str(editorial_path.parent)]
+        if data["comparison_style"] == "short":
+            args += ["--byline-only"]
+        else:
+            args += ["--no-dialogue-captions"]
     if data.get("size"):
         args += ["--size", str(data["size"])]
 
     watermark = data.get("watermark") or "mv-edits"
     args += ["--watermark", watermark]
+    args += ["--no-end-card" if data.get("end_card") is False else "--end-card"]
+    if data.get("end_card_duration") is not None:
+        try:
+            end_card_duration = float(data["end_card_duration"])
+        except (TypeError, ValueError):
+            return web.json_response({"error": "End-card duration must be 1.5–2.5 seconds"}, status=400)
+        if not 1.5 <= end_card_duration <= 2.5:
+            return web.json_response({"error": "End-card duration must be 1.5–2.5 seconds"}, status=400)
+        args += ["--end-card-duration", str(end_card_duration)]
 
-    if mode == "narrated":
-        args += ["--narrate"]
-        if data.get("narration_volume") is not None:
-            args += ["--narration-volume", str(data["narration_volume"])]
-        if data.get("tts_voice"):
-            args += ["--tts-voice", str(data["tts_voice"])]
-    elif mode == "recap":
-        # Recap montage: main.py needs the SRT (beats + captions) and the music
-        # (bg-music, supplied by the Background-music block below). The outro
-        # face-scan + beat-sync all run inside main.py.
-        args += ["--mode", "recap"]
+    args += ["--selection", selection, "--voice", voice]
+    if voice in ("commentary", "storytelling") and data.get("tts_voice"):
+        args += ["--tts-voice", str(data["tts_voice"])]
+    if voice in ("commentary", "storytelling") and data.get("narration_volume") is not None:
+        args += ["--narration-volume", str(data["narration_volume"])]
+    if voice in ("commentary", "storytelling") and data.get("audio_mix"):
+        args += ["--audio-mix", str(data["audio_mix"])]
+    if voice in ("commentary", "storytelling") and data.get("dialogue_volume") is not None:
+        args += ["--dialogue-volume", str(data["dialogue_volume"])]
+    if auto_ranges:
+        # Recap montage: main.py needs the SRT (beats + captions). Music is
+        # optional — with a track the cuts snap to its beats and the dialogue
+        # ducks under it, without one the cuts stay where the LLM put them.
+        # The outro face-scan runs inside main.py either way.
         if data.get("target_seconds") is not None:
             args += ["--target-seconds", str(data["target_seconds"])]
         if (data.get("recap_model") or "").strip():
@@ -843,6 +1021,31 @@ async def start_run(request: web.Request) -> web.Response:
                 pass
         if (data.get("outro_shots") or "").strip():
             args += ["--outro-shots", str(data["outro_shots"]).strip()]
+        # Movie SPAN: scope the auto picker. Ticked curated scenes (a multi-window
+        # "a-b; c-d" string) win over the single-window slider.
+        curated = (data.get("curated_region") or "").strip()
+        if curated:
+            args += ["--span", curated]
+        else:
+            try:
+                ss, se = float(data.get("span_start")), float(data.get("span_end"))
+                if se > ss + 1:
+                    def _hms(t):
+                        return f"{int(t // 3600)}:{int(t % 3600 // 60):02d}:{int(t % 60):02d}"
+                    args += ["--span", f"{_hms(ss)}-{_hms(se)}"]
+            except (TypeError, ValueError):
+                pass
+
+    # Cold-open hook + speech-gap boundary snap (both apply across selections).
+    if data.get("hook"):
+        args += ["--hook"]
+        if data.get("hook_count"):
+            try:
+                args += ["--hook-count", str(int(data["hook_count"]))]
+            except (TypeError, ValueError):
+                pass
+    if data.get("no_snap_speech"):
+        args += ["--no-snap-speech"]
 
     # Two-phase applies to EVERY run now (narrated or classic): reuse the
     # prepared cut + hand-picked thumbnail, and bake the thumbnail into the video
@@ -879,11 +1082,26 @@ async def start_run(request: web.Request) -> web.Response:
     # always vertical regardless of the checkbox.
     aspect = (data.get("aspect") or "vertical").strip()
     layout = aspect if aspect in ("vertical", "square", "landscape") else "vertical"
-    if mode == "narrated":
-        layout = "vertical"   # the narration text band needs the vertical space
-    args += ["--layout", layout]
+    # No mode may override the shape any more — that coupling is exactly what
+    # made the thumbnail unchangeable in narrated edits.
+    args += ["--shape", layout]
+    # Thumbnail is opt-out now, in every mode. Off means main.py composes none
+    # and bakes none — the two-phase picker is skipped client-side to match.
+    if data.get("want_thumbnail") is False:
+        args += ["--no-thumbnail"]
+    else:
+        # Say so explicitly: classic edits compose none unless asked.
+        args += ["--thumbnail"]
+        thumb_w, thumb_h = {
+            "vertical":  (1080, 1920),
+            "square":    (1080, 1080),
+            "landscape": (1920, 1080),
+        }[layout]
+        args += ["--thumbnail-size", f"{thumb_w}x{thumb_h}"]
     if data.get("remove_silence"):
         args += ["--remove-silence"]
+    if data.get("no_loudnorm"):
+        args += ["--no-loudnorm"]
 
     # Caption style options
     if data.get("caption_font"):
@@ -894,6 +1112,10 @@ async def start_run(request: web.Request) -> web.Response:
         args += ["--caption-color", str(data["caption_color"])]
     if data.get("caption_shuffle") is False:
         args += ["--no-caption-shuffle"]
+    if data.get("caption_font_shuffle"):
+        args += ["--caption-font-shuffle"]
+    if data.get("caption_italic"):
+        args += ["--caption-italic"]
     if data.get("mirror"):
         args += ["--mirror"]
 
@@ -928,9 +1150,10 @@ async def start_run(request: web.Request) -> web.Response:
     else:
         args += ["--no-edit-credits"]
 
-    ollama_err = await _ensure_ollama()
-    if ollama_err:
-        raise web.HTTPServiceUnavailable(text=ollama_err)
+    if not data.get("editorial_file") or selection in ("scene", "spine") or data.get("hook"):
+        ollama_err = await _ensure_ollama()
+        if ollama_err:
+            raise web.HTTPServiceUnavailable(text=ollama_err)
 
     run_state.reset()
     run_state.total_steps = _expected_steps(args)
@@ -1164,110 +1387,487 @@ summary{font-size:12px;color:var(--text-muted);cursor:pointer;padding:4px 0}
 #result-thumb{max-width:270px;display:block;margin:0 auto 10px;border:1px solid var(--border-bright)}
 .thumb-status{font-size:11.5px;color:var(--text-faint);margin-left:10px}
 .thumb-status.ok{color:var(--ok)}
+
+/* ── Visual layer ────────────────────────────────────────────────────────────
+   Everything below refines the base rules above: a warmer, deeper ground, a
+   real header, format cards instead of a bare <select>, switch-style toggles,
+   and section chrome that makes the per-mode show/hide legible at a glance. */
+:root{
+  --accent2:#ffb648;          /* amber end of the accent gradient */
+  --violet:#7c6cff;
+  --panel-2:#161b26;
+  --glow:0 0 0 1px rgba(255,122,48,.35), 0 8px 28px -10px rgba(255,122,48,.55);
+}
+html,body{
+  background:
+    radial-gradient(900px 420px at 12% -8%, rgba(255,122,48,.13), transparent 62%),
+    radial-gradient(760px 400px at 92% 4%, rgba(124,108,255,.11), transparent 60%),
+    var(--bg);
+  background-attachment:fixed;
+}
+body{max-width:680px;padding:26px 15px 72px}
+
+/* Header */
+.hero{display:flex;align-items:center;gap:13px;margin-bottom:22px}
+.hero-mark{
+  width:44px;height:44px;flex-shrink:0;border-radius:13px;display:grid;place-items:center;
+  font-size:22px;background:linear-gradient(145deg,var(--accent),var(--accent2));
+  box-shadow:0 8px 24px -8px rgba(255,122,48,.75);
+}
+h1{
+  font-size:21px;font-weight:750;letter-spacing:-.2px;line-height:1.1;
+  background:linear-gradient(92deg,var(--text) 30%,var(--accent2));
+  -webkit-background-clip:text;background-clip:text;-webkit-text-fill-color:transparent;
+}
+.sub{margin-bottom:0;font-size:12.5px}
+
+/* Sections */
+fieldset{
+  background:linear-gradient(180deg,var(--panel-2),var(--panel));
+  border-color:var(--border);border-radius:13px;padding:16px 15px;margin-bottom:13px;
+  box-shadow:0 1px 0 rgba(255,255,255,.03) inset;
+}
+fieldset[data-mode-only]{border-left:2px solid var(--accent)}
+legend{
+  font-size:10.5px;font-weight:700;letter-spacing:1.1px;color:var(--text-muted);
+  background:var(--bg);border:1px solid var(--border);border-radius:20px;padding:3px 10px;
+}
+label{font-size:11.5px;letter-spacing:.2px}
+input[type=text],input[type=number],select{background:rgba(0,0,0,.32);border-radius:8px;padding:10px 11px}
+input:focus,select:focus{border-color:var(--accent);box-shadow:0 0 0 3px rgba(255,122,48,.13)}
+select{appearance:none;background-image:linear-gradient(45deg,transparent 50%,var(--text-muted) 50%),
+  linear-gradient(135deg,var(--text-muted) 50%,transparent 50%);
+  background-position:calc(100% - 17px) 50%,calc(100% - 12px) 50%;
+  background-size:5px 5px,5px 5px;background-repeat:no-repeat;padding-right:32px}
+
+/* Format cards */
+.fmt-cards{display:flex;flex-direction:column;gap:8px}
+.fmt{
+  display:flex;gap:12px;align-items:flex-start;text-align:left;width:100%;cursor:pointer;
+  background:rgba(0,0,0,.3);border:1px solid var(--border);border-radius:11px;
+  padding:12px 13px;color:var(--text);font:inherit;transition:border-color .16s,background .16s,transform .1s;
+}
+.fmt:hover{border-color:var(--border-bright)}
+.fmt:active{transform:scale(.994)}
+.fmt[aria-pressed="true"]{
+  /* Shorthand, not border-color: the base .fmt rule sets `border` as a shorthand
+     and a longhand override here loses to it in some engines. */
+  border:1px solid var(--accent);
+  background:linear-gradient(180deg,rgba(255,122,48,.13),rgba(255,122,48,.05));
+  box-shadow:var(--glow);
+}
+.fmt-ico{font-size:19px;line-height:1.25;flex-shrink:0}
+.fmt-body{display:block;min-width:0}
+.fmt-name{display:block;font-size:14px;font-weight:700;letter-spacing:-.1px;margin-bottom:3px}
+.fmt-desc{display:block;font-size:11.5px;color:var(--text-muted);line-height:1.5;margin-bottom:7px}
+
+/* Pills */
+.pill{
+  display:inline-block;font-size:10px;font-weight:600;letter-spacing:.3px;
+  border:1px solid var(--border-bright);color:var(--text-muted);
+  border-radius:20px;padding:2.5px 8px;margin-right:5px;white-space:nowrap;
+}
+.pill.good{border-color:rgba(61,220,132,.45);color:var(--ok);background:rgba(61,220,132,.08)}
+.pill.warn{border-color:rgba(255,182,72,.45);color:var(--accent2);background:rgba(255,182,72,.08)}
+.pill.audio{border-color:rgba(255,122,48,.4);color:var(--accent);background:rgba(255,122,48,.07)}
+
+/* Switch-style checkboxes */
+.switch{display:flex;align-items:center;gap:11px;cursor:pointer;margin:12px 0 0;
+  font-size:12.5px;color:var(--text);line-height:1.45}
+.switch:first-child{margin-top:0}
+.switch input{appearance:none;flex-shrink:0;width:38px;height:22px;border-radius:20px;
+  background:rgba(255,255,255,.09);border:1px solid var(--border-bright);
+  position:relative;cursor:pointer;transition:background .18s,border-color .18s;margin:0}
+.switch input::after{content:"";position:absolute;top:2px;left:2px;width:16px;height:16px;
+  border-radius:50%;background:var(--text-muted);transition:transform .18s,background .18s}
+.switch input:checked{background:linear-gradient(135deg,var(--accent),var(--accent2));border-color:transparent}
+.switch input:checked::after{transform:translateX(16px);background:#1a0e05}
+.switch .sw-text{display:block}
+.switch .sw-sub{display:block;font-size:11px;color:var(--text-faint);margin-top:2px;line-height:1.45}
+
+/* Notes + hints */
+.note{font-size:11.5px;color:var(--text-faint);line-height:1.55;margin-top:8px}
+.note.lock{color:var(--accent2)}
+.note strong{color:var(--text-muted);font-weight:600}
+.readout{float:right;font-size:11px;color:var(--accent);font-weight:600;
+  font-family:ui-monospace,Consolas,monospace}
+.readout.over{color:var(--err)}
+.divider{height:1px;background:var(--border);margin:14px 0 2px}
+
+/* Segmented button group (replaces small style dropdowns) */
+.seg-group{display:flex;gap:6px;flex-wrap:wrap;margin-top:2px}
+.seg{flex:1;min-width:74px;padding:9px 8px;border-radius:8px;border:1px solid var(--border-bright);
+  background:rgba(255,255,255,.04);color:var(--text-muted);font-weight:600;font-size:12.5px;cursor:pointer;
+  transition:background .15s,border-color .15s,color .15s}
+.seg:hover{border-color:var(--accent2)}
+.seg.active{background:rgba(255,122,48,.14);border-color:var(--accent);color:var(--accent)}
+
+/* Buttons */
+.mini-btn{border-radius:7px;font-weight:600}
+.mini-btn.primary{border-color:rgba(255,122,48,.5);color:var(--accent);background:rgba(255,122,48,.09)}
+.mini-btn.primary:hover{background:rgba(255,122,48,.16)}
+#ai-btn{display:block;width:100%;margin-top:10px;padding:11px;font-size:12.5px}
+#submit{
+  background:linear-gradient(135deg,var(--accent),var(--accent2));
+  border-radius:11px;padding:15px;font-size:14.5px;letter-spacing:.2px;
+  box-shadow:0 10px 30px -12px rgba(255,122,48,.85);margin-top:8px;
+}
+#submit-hint{text-align:center;font-size:11.5px;color:var(--text-faint);margin-top:9px;line-height:1.5}
+#thumb-render{background:linear-gradient(135deg,var(--accent),var(--accent2));border-radius:10px}
+
+/* Progress + result */
+.step{height:6px;border-radius:4px}
+.step.active{background:linear-gradient(90deg,var(--accent),var(--accent2))}
+#result{border-radius:13px;box-shadow:0 12px 40px -20px rgba(61,220,132,.6)}
+#log{border-radius:8px;background:#04060a}
+#error{border-radius:9px;background:rgba(255,92,92,.07)}
+.suggestion{border-radius:9px;background:rgba(0,0,0,.28)}
+.suggestion:hover{background:rgba(255,122,48,.06)}
+#srt-status{font-size:12px;margin-top:8px;padding:9px 11px;border-radius:8px;
+  border:1px solid var(--border);background:rgba(0,0,0,.28)}
+#srt-status.found{color:var(--ok);border-color:rgba(61,220,132,.35);background:rgba(61,220,132,.07)}
+#srt-status.missing{color:var(--accent2);border-color:rgba(255,182,72,.32);background:rgba(255,182,72,.06)}
+@media (max-width:420px){
+  .fmt-desc{font-size:11px}
+  body{padding:20px 12px 64px}
+}
 </style>
 </head>
 <body>
 
-<h1>🎬 Movie Clipper</h1>
-<div class="sub">movie-shorts-clipper — cut, caption, and upload-ready in one run</div>
+<header class="hero">
+  <div class="hero-mark">🎬</div>
+  <div>
+    <h1>Movie Clipper</h1>
+    <div class="sub">Cut, caption, and upload-ready in one run</div>
+  </div>
+</header>
 
 <form id="form">
   <fieldset>
-    <legend>Format</legend>
-    <label for="format">Output format</label>
-    <select id="format">
-      <option value="narrated" selected>Narrated — TTS voiceover + text band (monetization-friendly)</option>
-      <option value="classic">Classic — square crop, karaoke captions</option>
-      <option value="recap">Recap Montage — beat-synced plot recap + iconic outro</option>
+    <legend>① WHAT ARE YOU MAKING</legend>
+    <div class="fmt-cards" id="fmt-cards">
+      <button type="button" class="fmt" data-value="narrated" aria-pressed="true">
+        <span class="fmt-ico">🎙️</span>
+        <span class="fmt-body">
+          <span class="fmt-name">Narrated Short</span>
+          <span class="fmt-desc">One scene with a voiceover talking over it, text band beneath. The clip you pick sets the length.</span>
+          <span class="pill audio">Voiceover over full audio</span><span class="pill good">Transformative</span><span class="pill">Your ranges</span><span class="pill">Vertical</span>
+        </span>
+      </button>
+      <button type="button" class="fmt" data-value="storytelling" aria-pressed="false">
+        <span class="fmt-ico">📖</span>
+        <span class="fmt-body">
+          <span class="fmt-name">Storytelling Recap</span>
+          <span class="fmt-desc">The narrator retells the whole plot over clips, as a lower third. <strong>The script sets the length</strong> — each clip runs exactly as long as its line.</span>
+          <span class="pill audio">Narrator leads · movie muted</span><span class="pill good">Narrator-led storytelling</span><span class="pill">Script picks clips</span><span class="pill">Landscape</span>
+        </span>
+      </button>
+      <button type="button" class="fmt" data-value="recap" aria-pressed="false">
+        <span class="fmt-ico">⚡</span>
+        <span class="fmt-body">
+          <span class="fmt-name">Recap Montage</span>
+          <span class="fmt-desc">Short plot beats cut back to back, carried by music with the dialogue ducked under it. No narrator.</span>
+          <span class="pill audio">Music bed · dialogue ducked</span><span class="pill good">Transformative</span><span class="pill">Beats picked for you</span>
+        </span>
+      </button>
+      <button type="button" class="fmt" data-value="classic" aria-pressed="false">
+        <span class="fmt-ico">✂️</span>
+        <span class="fmt-body">
+          <span class="fmt-name">Classic</span>
+          <span class="fmt-desc">A straight cut with karaoke captions. Nothing added on top.</span>
+          <span class="pill audio">Original audio kept</span><span class="pill warn">Fair-use only</span><span class="pill">Your ranges</span>
+        </span>
+      </button>
+    </div>
+    <select id="format" style="display:none" aria-hidden="true" tabindex="-1">
+      <option value="narrated" selected>Narrated Short</option>
+      <option value="storytelling">Storytelling Recap</option>
+      <option value="recap">Recap Montage</option>
+      <option value="classic">Classic</option>
+      <option value="custom">Custom</option>
     </select>
+
+    <details id="axes-details">
+      <summary>Mix your own — these presets are just three settings</summary>
+      <div class="note" style="margin-bottom:4px">
+        Every combination is buildable. A preset only fills these in for you; change one and
+        you get a custom edit.
+      </div>
+      <label for="sel_selection">Who picks the clips</label>
+      <select id="sel_selection">
+        <option value="manual">You do — the ranges below</option>
+        <option value="scene">Pick the best single scene for me</option>
+        <option value="spine">Pick a chain of plot beats for me</option>
+        <option value="script">The narration script picks them</option>
+      </select>
+      <label for="sel_voice">What carries the edit</label>
+      <select id="sel_voice">
+        <option value="none">Just the film's own dialogue</option>
+        <option value="commentary">Voiceover under full dialogue — commentary on one moment</option>
+        <option value="storytelling">Voiceover in front, dialogue ducked — retells the plot</option>
+        <option value="music">A music bed with the dialogue ducked under it</option>
+      </select>
+      <div id="axis-note" class="note"></div>
+    </details>
   </fieldset>
 
   <fieldset>
-    <legend>Source</legend>
+    <legend>② SOURCE</legend>
     <label for="video">Movie file path</label>
     <div class="range-row">
       <input type="text" id="video" placeholder="N:\\Movies\\film.mkv" required>
-      <button type="button" id="check-srt" class="mini-btn">Check subtitles</button>
+      <button type="button" id="check-srt" class="mini-btn">Re-check</button>
     </div>
-    <div id="srt-status"></div>
-    <label id="use-srt-wrap" style="display:none;align-items:center;gap:8px;cursor:pointer;margin-top:6px">
-      <input type="checkbox" id="use_srt" checked style="accent-color:var(--accent)">
-      <span>Use this subtitle file for captions (local, no upload)</span>
-    </label>
+    <div id="srt-status">Paste a movie path — subtitles are looked up automatically.</div>
 
-    <label>Clip range(s)</label>
-    <div id="ranges"></div>
-    <button type="button" id="add-range" class="mini-btn">+ Add range</button>
-    <div id="suggest-wrap" style="display:none;margin-top:10px">
-      <label for="suggest_model">Scene suggestion — model (the whole subtitle file is fed to it)</label>
-      <select id="suggest_model">
-        <option value="gemma4:e4b" selected>gemma4:e4b — local, no upload</option>
-        <option value="gemma4:e2b">gemma4:e2b — local, no upload</option>
-        <option value="__cloud__">Cloud — Ollama model below (uploads subtitles, uses bandwidth)</option>
-      </select>
-      <button type="button" id="suggest-btn" class="mini-btn">✨ Suggest scenes from subtitles</button>
+    <label class="switch" style="margin-top:10px">
+      <input type="checkbox" id="span_enable">
+      <span class="sw-text">Summarize only part of the movie
+        <span class="sw-sub">The clip-picker reads &amp; picks from just this stretch — render sections separately. Bounds set from the movie's length after the check above.</span>
+      </span>
+    </label>
+    <div id="span-wrap" style="display:none">
+      <label>From <span id="span-from-val" class="readout">0:00</span></label>
+      <input type="range" id="span_start" min="0" max="6000" step="1" value="0">
+      <label>To <span id="span-to-val" class="readout">end</span></label>
+      <input type="range" id="span_end" min="0" max="6000" step="1" value="6000">
     </div>
-    <div id="suggestions"></div>
 
     <label for="source_title">Source title override (optional)</label>
     <input type="text" id="source_title" placeholder="Auto-parsed from filename if left blank">
   </fieldset>
 
-  <fieldset id="narrate-fieldset">
-    <legend>Narration</legend>
-    <label style="display:flex;align-items:center;gap:8px;margin:0;cursor:pointer">
-      <input type="checkbox" id="narrate" checked style="accent-color:var(--accent)">
-      <span>Narrated vertical format — TTS voiceover + text beneath the video</span>
+  <fieldset id="subs-fieldset">
+    <legend>③ SUBTITLES &amp; SCENE AI</legend>
+    <label class="switch" id="use-srt-wrap" style="display:none">
+      <input type="checkbox" id="use_srt" checked>
+      <span class="sw-text">Use this subtitle file
+        <span class="sw-sub">Drives the burned captions, the scene picks, and the narration script — all locally, nothing uploaded.</span>
+      </span>
     </label>
-    <div id="narrate-opts">
-      <label for="tts_voice">Narrator voice</label>
-      <select id="tts_voice">
-        <option value="en-US-JennyNeural" selected>Jenny (US, female)</option>
-        <option value="en-US-ChristopherNeural">Christopher (US, deep)</option>
-        <option value="en-US-GuyNeural">Guy (US)</option>
-        <option value="en-GB-RyanNeural">Ryan (British)</option>
-        <option value="en-GB-SoniaNeural">Sonia (British)</option>
-        <option value="en-AU-WilliamNeural">William (Australian)</option>
+    <div id="subs-none" class="note">
+      No subtitle file yet. Captions can still be transcribed with Whisper, but the
+      scene AI below needs an <strong>.srt</strong> next to the movie.
+    </div>
+    <div id="suggest-wrap" style="display:none">
+      <div class="divider"></div>
+      <label for="suggest_model">Model that reads the subtitle file</label>
+      <select id="suggest_model">
+        <option value="gemma4:e4b" selected>gemma4:e4b — local, nothing uploaded</option>
+        <option value="gemma4:e2b">gemma4:e2b — local, smaller and faster</option>
+        <option value="__cloud__">Cloud — the Ollama model under Generation (uploads the subtitles)</option>
       </select>
-      <label for="narration_volume">Voiceover volume <span id="nvolume-val">0.04</span></label>
-      <input type="range" id="narration_volume" min="0" max="1" step="0.01" value="0.04">
+      <button type="button" id="ai-btn" class="mini-btn primary">✨ Suggest scenes from subtitles</button>
+      <div id="ai-hint" class="note">The whole subtitle file goes to the model; it comes back with clip ranges you can click to add.</div>
+      <div id="ai-status" class="note"></div>
+    </div>
+    <div id="suggestions"></div>
+  </fieldset>
+
+  <fieldset>
+    <legend>④ CLIPS &amp; LENGTH</legend>
+    <div id="ranges-wrap">
+      <label>Clip range(s) <span id="ranges-total" class="readout"></span></label>
+      <div id="ranges"></div>
+      <button type="button" id="add-range" class="mini-btn">+ Add range</button>
+      <div id="ranges-note" class="note"></div>
+      <div class="divider"></div>
+    </div>
+    <label for="target_len">Target length <span id="target-len-val" class="readout">120s</span></label>
+    <input type="range" id="target_len" min="30" max="180" step="10" value="120">
+    <div id="length-hint" class="note"></div>
+
+    <div class="divider"></div>
+    <label class="switch">
+      <input type="checkbox" id="hook">
+      <span class="sw-text">Cold-open hook
+        <span class="sw-sub">Open with the 1-3 punchiest lines as a teaser, before the main content.</span>
+      </span>
+    </label>
+    <label class="switch">
+      <input type="checkbox" id="snap_speech" checked>
+      <span class="sw-text">Snap cuts to speech gaps
+        <span class="sw-sub">Verify clip boundaries against the audio so lines don't cut mid-sentence (adds a short pass).</span>
+      </span>
+    </label>
+  </fieldset>
+
+  <fieldset id="narrate-fieldset" data-mode-only>
+    <legend>NARRATION</legend>
+    <input type="checkbox" id="narrate" checked style="display:none">
+    <label for="tts_voice">Narrator voice</label>
+    <select id="tts_voice">
+      <option value="en-US-JennyNeural" selected>Jenny (US, female)</option>
+      <option value="en-US-ChristopherNeural">Christopher (US, deep)</option>
+      <option value="en-US-GuyNeural">Guy (US)</option>
+      <option value="en-GB-RyanNeural">Ryan (British)</option>
+      <option value="en-GB-SoniaNeural">Sonia (British)</option>
+      <option value="en-AU-WilliamNeural">William (Australian)</option>
+    </select>
+    <div id="narrate-opts">
+      <div id="narrate-kind" class="note"></div>
+      <div id="audio-mix-wrap">
+        <label for="audio_mix">Commentary audio mix</label>
+        <select id="audio_mix"><option value="narrator-led" selected>Narrator leads: film ducks</option><option value="original">Original: film leads (narration sits ~25 dB under it)</option><option value="narration-only">Narration only: source soundtrack muted</option></select>
+        <div class="note">Review separately: original contribution, footage/audio rights, and ad suitability. This control does not clear copyright claims.</div>
+      </div>
+      <div id="narrate-level-wrap">
+        <label for="narration_volume"><span id="nvol-label">Voiceover volume</span> <span id="nvolume-val" class="readout">0.04</span></label>
+        <input type="range" id="narration_volume" min="0" max="1" step="0.01" value="0.04">
+      </div>
+      <div id="dialogue-level-wrap" style="display:none">
+        <label for="dialogue_volume">Dialogue under the narrator <span id="dvolume-val" class="readout">0.22</span></label>
+        <input type="range" id="dialogue_volume" min="0" max="1" step="0.01" value="0.22">
+        <div class="note">How loud the film sits beneath the voice. It ducks further
+          automatically whenever the narrator is speaking.</div>
+      </div>
     </div>
   </fieldset>
 
-  <fieldset id="recap-fieldset" style="display:none">
-    <legend>Recap Montage</legend>
-    <p style="color:var(--text-faint);font-size:13px;margin:0 0 10px">
-      Needs a subtitle file (drives the beat picks + captions) and a hand-picked music
-      track under <em>Background music</em> below (the whole edit is cut to its beats).
-      Dialogue is ducked under a loud music bed — no narration.
-      <br><strong>Leave the clip ranges empty</strong> to auto-build the recap from the whole
-      movie, or click below to preview and tweak the beats first.
-    </p>
-    <button type="button" id="recap-build-btn" class="mini-btn">🎬 Build recap from subtitles (optional preview)</button>
-    <div id="recap-build-status" style="color:var(--text-faint);font-size:13px;margin-top:6px"></div>
+  <fieldset id="script-fieldset" data-mode-only style="display:none">
+    <legend>NARRATION SCRIPT</legend>
+    <div class="note">
+      The model reads the whole subtitle file and writes a connected retelling of the plot.
+      That script is then spoken, and <strong>each clip is cut to last exactly as long as its
+      line takes to read</strong> — so the target length above is a length of <em>narration</em>,
+      not of footage, and you don't pick ranges at all.
+      <br>Because the clips don't exist until the script has been spoken, this is the one
+      edit that can't stop for a hand-picked thumbnail.
+    </div>
+  </fieldset>
 
-    <label for="recap_target" style="margin-top:12px">Target length <span id="recap-target-val">120</span>s</label>
-    <input type="range" id="recap_target" min="30" max="180" step="10" value="120">
-
-    <label style="display:flex;align-items:center;gap:8px;cursor:pointer;margin-top:12px">
-      <input type="checkbox" id="recap_outro" checked style="accent-color:var(--accent)">
-      <span>Beat-synced iconic outro — rapid face-shot montage on the final seconds</span>
+  <fieldset id="recap-fieldset" data-mode-only style="display:none">
+    <legend>RECAP MONTAGE</legend>
+    <div class="note">
+      Needs a subtitle file — it drives both the beat picks and the captions.
+      <strong>Leave the ranges empty</strong> to recap the whole movie, add one long
+      range to scope it to a stretch, or hit the AI button above to preview and tweak the beats.
+      <br>Pick a music track under <em>Background music</em> and the cuts snap to its beats
+      with the dialogue ducked underneath. Leave music off and the cuts land exactly
+      where the model put them, carried by the movie's own audio.
+    </div>
+    <div class="divider"></div>
+    <label class="switch">
+      <input type="checkbox" id="recap_outro">
+      <span class="sw-text">Iconic outro montage <span style="color:var(--text-faint)">(beta)</span>
+        <span class="sw-sub">Rapid face-shot stills on the final seconds, beat-synced when there is music. Off by default.</span>
+      </span>
     </label>
-    <div id="recap-outro-opts">
-      <label for="outro_seconds">Outro length <span id="outro-sec-val">5</span>s</label>
+    <div id="recap-outro-opts" style="display:none">
+      <label for="outro_seconds">Outro length <span id="outro-sec-val" class="readout">5s</span></label>
       <input type="range" id="outro_seconds" min="2" max="12" step="1" value="5">
-      <label for="auto_outro_shots" style="margin-top:12px">Auto-find this many iconic face shots (0 = off, scans at render)</label>
+      <label for="auto_outro_shots">Auto-find this many iconic face shots (0 = off, scans at render)</label>
       <input type="number" id="auto_outro_shots" min="0" max="30" step="1" value="12">
-      <label for="outro_shots_manual" style="margin-top:12px">Extra iconic timestamps (optional, comma-separated)</label>
+      <label for="outro_shots_manual">Extra iconic timestamps (optional, comma-separated)</label>
       <input type="text" id="outro_shots_manual" placeholder="1:02:10, 1:15:03">
     </div>
   </fieldset>
 
   <fieldset>
-    <legend>Generation</legend>
+    <legend>⑤ OUTPUT &amp; THUMBNAIL</legend>
+    <label for="aspect">Output shape</label>
+    <select id="aspect">
+      <option value="vertical" selected>9:16 vertical — Shorts / TikTok</option>
+      <option value="square">1:1 square</option>
+      <option value="landscape">16:9 landscape — long-form YouTube</option>
+    </select>
+    <div id="aspect-note" class="note"></div>
+    <div class="divider"></div>
+    <label class="switch">
+      <input type="checkbox" id="want_thumbnail">
+      <span class="sw-text">Pick the thumbnail by hand
+        <span class="sw-sub" id="thumb-shape-note"></span>
+      </span>
+    </label>
+  </fieldset>
+
+  <fieldset>
+    <legend>⑥ CAPTIONS</legend>
+    <label for="caption_font">Font</label>
+    <select id="caption_font">
+      <option value="Anton">Anton ★ — bundled, viral-shorts caps</option>
+      <option value="Bebas Neue">Bebas Neue ★ — bundled, tall condensed</option>
+      <option value="Impact">Impact</option>
+      <option value="Arial Black" selected>Arial Black</option>
+      <option value="Verdana">Verdana</option>
+      <option value="Tahoma">Tahoma</option>
+      <option value="Trebuchet MS">Trebuchet MS</option>
+      <option value="Georgia">Georgia</option>
+      <option value="Comic Sans MS">Comic Sans MS</option>
+    </select>
+    <label class="switch">
+      <input type="checkbox" id="caption_font_shuffle">
+      <span class="sw-text">Shuffle fonts
+        <span class="sw-sub">Cycle a different typeface each sentence, starting from the font above. Works off the subtitle file or a Whisper transcript.</span>
+      </span>
+    </label>
+    <label class="switch">
+      <input type="checkbox" id="caption_italic">
+      <span class="sw-text">Italic captions
+        <span class="sw-sub">Render the burned captions slanted.</span>
+      </span>
+    </label>
+    <label>Effect</label>
+    <div class="seg-group" id="caption_animation_btns">
+      <button type="button" class="seg active" data-value="karaoke">Karaoke</button>
+      <button type="button" class="seg" data-value="fade">Fade</button>
+      <button type="button" class="seg" data-value="pop">Pop</button>
+    </div>
+    <input type="hidden" id="caption_animation" value="karaoke">
+    <label class="switch">
+      <input type="checkbox" id="caption_shuffle" checked>
+      <span class="sw-text">Shuffle colours
+        <span class="sw-sub">Cycle a different colour each sentence.</span>
+      </span>
+    </label>
+    <div id="caption_color_wrap" style="display:none">
+      <label for="caption_color">Fixed colour</label>
+      <select id="caption_color">
+        <option value="white" selected>White</option>
+        <option value="yellow">Yellow</option>
+        <option value="green">Green</option>
+        <option value="cyan">Cyan</option>
+        <option value="pink">Pink</option>
+        <option value="orange">Orange</option>
+      </select>
+    </div>
+  </fieldset>
+
+  <fieldset>
+    <legend>CHANNEL END CARD</legend>
+    <label><input type="checkbox" id="end_card" checked> End with channel identity and Subscribe</label>
+    <label for="end_card_duration">End-card seconds</label>
+    <input type="number" id="end_card_duration" min="1.5" max="2.5" step="0.1" value="2">
+    <div class="note">Adds this time after the edit. Branding and wording come from brand.json. Turn off for a fixed-runtime comparison.</div>
+  </fieldset>
+
+  <fieldset>
+    <legend>⑦ BACKGROUND MUSIC</legend>
+    <label for="bg_mode">Mode</label>
+    <select id="bg_mode">
+      <option value="none" selected>None</option>
+      <option value="random">Random from audio/</option>
+      <option value="file">Specific file</option>
+    </select>
+    <div id="music-note" class="note"></div>
+    <div id="bg-file-wrap" style="display:none">
+      <label for="bg_music">File</label>
+      <select id="bg_music"></select>
+    </div>
+    <div id="bg-audio-opts" style="display:none">
+      <label for="bg_volume">Volume <span id="volume-val" class="readout">0.10</span></label>
+      <input type="range" id="bg_volume" min="0" max="1" step="0.01" value="0.10">
+      <label for="bg_skip">Skip first N seconds of the track (cut a slow intro)</label>
+      <input type="number" id="bg_skip" min="0" step="0.5" value="0" placeholder="0">
+    </div>
+  </fieldset>
+
+  <fieldset>
+    <legend>⑧ GENERATION</legend>
     <div class="row">
-      <div>
-        <label for="whisper_model">Whisper model (fallback, no SRT)</label>
+      <div id="whisper-wrap">
+        <label for="whisper_model">Whisper model (no subtitles)</label>
         <select id="whisper_model">
           <option value="tiny">tiny</option>
           <option value="base">base</option>
@@ -1284,93 +1884,46 @@ summary{font-size:12px;color:var(--text-muted);cursor:pointer;padding:4px 0}
         </select>
       </div>
     </div>
-    <label for="ollama_model">Ollama model</label>
+    <label for="ollama_model">Model that writes the copy (title, description, narration)</label>
     <input type="text" id="ollama_model" value="nemotron-3-super:cloud">
-    <label style="display:flex;align-items:center;gap:8px;cursor:pointer;margin-top:12px">
-      <input type="checkbox" id="remove_silence" style="accent-color:var(--accent)">
-      <span>Remove blank spaces — cut gaps where the audio is near-silent (no dialogue)</span>
+    <label for="editorial_file">Approved editorial file (optional, commentary or storytelling)</label>
+    <input type="text" id="editorial_file" placeholder="Path to approved editorial.json">
+    <label class="switch">
+      <input type="checkbox" id="loudnorm" checked>
+      <span class="sw-text">Loudness master (−14 LUFS)
+        <span class="sw-sub">Normalize the final audio to the social-media standard so the clip is as loud and consistent as other creators'. On by default.</span>
+      </span>
     </label>
-    <label style="display:flex;align-items:center;gap:8px;cursor:pointer;margin-top:12px">
-      <input type="checkbox" id="mirror" style="accent-color:var(--accent)">
-      <span>Mirror clip — flip the footage left-right (captions &amp; narration stay upright)</span>
+    <label class="switch" id="silence-wrap">
+      <input type="checkbox" id="remove_silence">
+      <span class="sw-text">Tighten pauses (remove blank spaces)
+        <span class="sw-sub">Cut the gaps where the audio is near-silent and remap the captions. Best on your own ranges; skipped for auto-picked recap beats.</span>
+      </span>
     </label>
-    <label for="aspect" style="margin-top:12px">Output shape</label>
-    <select id="aspect">
-      <option value="vertical" selected>9:16 vertical — Shorts / TikTok (under 3 min)</option>
-      <option value="square">1:1 square</option>
-      <option value="landscape">16:9 landscape — long-form / regular YouTube</option>
-    </select>
+    <label class="switch">
+      <input type="checkbox" id="mirror">
+      <span class="sw-text">Mirror clip
+        <span class="sw-sub">Flip the footage left-right; captions and narration stay upright.</span>
+      </span>
+    </label>
   </fieldset>
 
   <fieldset>
-    <legend>Captions</legend>
-    <label for="caption_font">Font</label>
-    <select id="caption_font">
-      <option value="Arial Black" selected>Arial Black</option>
-      <option value="Impact">Impact</option>
-      <option value="Verdana">Verdana</option>
-      <option value="Tahoma">Tahoma</option>
-      <option value="Trebuchet MS">Trebuchet MS</option>
-      <option value="Georgia">Georgia</option>
-      <option value="Comic Sans MS">Comic Sans MS</option>
-    </select>
-    <label for="caption_animation" style="margin-top:12px">Effect</label>
-    <select id="caption_animation">
-      <option value="karaoke" selected>Karaoke — words light up one by one</option>
-      <option value="fade">Fade — whole line fades in</option>
-      <option value="pop">Pop — whole line scales in</option>
-    </select>
-    <label style="display:flex;align-items:center;gap:8px;cursor:pointer;margin-top:12px">
-      <input type="checkbox" id="caption_shuffle" checked style="accent-color:var(--accent)">
-      <span>Shuffle colours — cycle a different colour each sentence</span>
-    </label>
-    <div id="caption_color_wrap" style="display:none;margin-top:10px">
-      <label for="caption_color">Fixed colour</label>
-      <select id="caption_color">
-        <option value="white" selected>White</option>
-        <option value="yellow">Yellow</option>
-        <option value="green">Green</option>
-        <option value="cyan">Cyan</option>
-        <option value="pink">Pink</option>
-        <option value="orange">Orange</option>
-      </select>
-    </div>
-  </fieldset>
-
-  <fieldset>
-    <legend>Background music</legend>
-    <label for="bg_mode">Mode</label>
-    <select id="bg_mode">
-      <option value="none" selected>None</option>
-      <option value="random">Random from audio/</option>
-      <option value="file">Specific file</option>
-    </select>
-    <div id="bg-file-wrap" style="display:none">
-      <label for="bg_music">File</label>
-      <select id="bg_music"></select>
-    </div>
-    <div id="bg-audio-opts" style="display:none">
-      <label for="bg_volume">Volume <span id="volume-val">0.10</span></label>
-      <input type="range" id="bg_volume" min="0" max="1" step="0.01" value="0.10">
-      <label for="bg_skip">Skip first N seconds of the track (cut a slow intro)</label>
-      <input type="number" id="bg_skip" min="0" step="0.5" value="0" placeholder="0">
-    </div>
-  </fieldset>
-
-  <fieldset>
-    <legend>Description &amp; credits</legend>
-    <label style="display:flex;align-items:center;gap:8px;margin:0;cursor:pointer">
-      <input type="checkbox" id="edit_credits" style="accent-color:var(--accent)">
-      <span>Edit-style description — Movie / Music / Editing credits + hashtags + fair-use disclaimer</span>
+    <legend>⑨ DESCRIPTION &amp; CREDITS</legend>
+    <label class="switch">
+      <input type="checkbox" id="edit_credits">
+      <span class="sw-text">Edit-style description
+        <span class="sw-sub">Movie / Music / Editing credits, hashtags, and a fair-use disclaimer.</span>
+      </span>
     </label>
     <div id="edit-credits-opts" style="display:none">
-      <label for="music_credit" style="margin-top:12px">Music credit (the “Music:” line)</label>
+      <label for="music_credit">Music credit (the “Music:” line)</label>
       <input type="text" id="music_credit" placeholder="Artist – Track (auto-filled from the music file)">
-      <label for="editing_program" style="margin-top:12px">Editing program (the “Editing Program:” line)</label>
+      <label for="editing_program">Editing program (the “Editing Program:” line)</label>
       <input type="text" id="editing_program" value="Adobe After Effects 2024">
-      <label style="display:flex;align-items:center;gap:8px;cursor:pointer;margin-top:12px">
-        <input type="checkbox" id="edit_disclaimer" checked style="accent-color:var(--accent)">
-        <span>Include the © fair-use copyright disclaimer</span>
+      <label class="switch">
+        <input type="checkbox" id="edit_disclaimer" checked>
+        <span class="sw-text">Include the © fair-use disclaimer</span>
       </label>
     </div>
   </fieldset>
@@ -1387,9 +1940,28 @@ summary{font-size:12px;color:var(--text-muted);cursor:pointer;padding:4px 0}
         <input type="text" id="language" value="en">
       </div>
     </div>
+    <label class="switch">
+      <input type="checkbox" id="skip_thumbnail">
+      <span class="sw-text">Don't make a thumbnail at all
+        <span class="sw-sub">Skips the thumbnail entirely. Leave off unless you already have one.</span>
+      </span>
+    </label>
   </details>
 
+  <fieldset>
+    <legend>COMPARE SHORT AND LONG EDITS</legend>
+    <p>Use the enabled source window above. Both versions cover the same four story developments at the same runtime. The Short keeps dialogue with brief bylines; the landscape version uses fuller narration.</p>
+    <label for="comparison-duration">Shared runtime (seconds)</label>
+    <input id="comparison-duration" type="number" min="30" max="150" value="60" step="10">
+    <label for="comparison-feedback">Review feedback (optional)</label><textarea id="comparison-feedback" placeholder="Corrections to character attribution or story continuity"></textarea>
+<button type="button" id="comparison-build">Build and review both edit plans</button>
+    <div id="comparison-review" style="white-space:pre-wrap"></div>
+    <label><input type="checkbox" id="comparison-approved"> I reviewed character attribution, story continuity and the candidate frames.</label>
+    <button type="button" id="comparison-short" disabled>Render Short — cuts and bylines</button>
+    <button type="button" id="comparison-long" disabled>Render landscape — full narration</button>
+  </fieldset>
   <button type="submit" id="submit">① Cut clip &amp; pick thumbnail</button>
+  <div id="submit-hint"></div>
 </form>
 
 <div id="error"></div>
@@ -1412,7 +1984,7 @@ summary{font-size:12px;color:var(--text-muted);cursor:pointer;padding:4px 0}
   <div id="thumb-editor" style="display:none">
     <div class="thumb-head">Thumbnail</div>
     <img id="result-thumb" style="display:none" alt="thumbnail">
-    <div class="thumb-hint">Scrub to a frame, then move the crop slider to choose which 9:16 slice of the shot to keep (the highlighted box shows it). Title and movie name are drawn on automatically.</div>
+    <div class="thumb-hint">Scrub to a frame, then move the crop slider to choose which slice of the shot to keep (the highlighted box shows it, sized to your output shape). Title and movie name are drawn on automatically.</div>
     <div id="thumb-video-wrap">
       <video id="thumb-video" controls preload="metadata"></video>
       <div id="thumb-cropbox"></div>
@@ -1420,8 +1992,8 @@ summary{font-size:12px;color:var(--text-muted);cursor:pointer;padding:4px 0}
     <label for="thumb-pan">Crop position <span id="thumb-pan-val">center</span></label>
     <input type="range" id="thumb-pan" min="0" max="100" value="50">
     <div class="row">
-      <div><label for="thumb-title">Title (top of thumbnail + burned into the video)</label><input type="text" id="thumb-title"></div>
-      <div><label for="thumb-movie">Movie name (bottom)</label><input type="text" id="thumb-movie"></div>
+      <div><label for="thumb-title">Title (top of thumbnail + burned into the video)</label><input type="text" id="thumb-title" autocapitalize="off" autocorrect="off" spellcheck="false"></div>
+      <div><label for="thumb-movie">Movie name (bottom)</label><input type="text" id="thumb-movie" autocapitalize="off" autocorrect="off" spellcheck="false"></div>
     </div>
     <button type="button" id="title-suggest" class="mini-btn" style="margin-top:8px">✨ Suggest titles</button>
     <div id="title-options"></div>
@@ -1499,8 +2071,37 @@ const resultEl   = document.getElementById('result');
 const videoInput = document.getElementById('video');
 const checkSrtBtn = document.getElementById('check-srt');
 const srtStatus  = document.getElementById('srt-status');
-const suggestBtn = document.getElementById('suggest-btn');
 const suggestWrap = document.getElementById('suggest-wrap');
+const subsNone   = document.getElementById('subs-none');
+const aiBtn      = document.getElementById('ai-btn');
+const aiHint     = document.getElementById('ai-hint');
+const aiStatus   = document.getElementById('ai-status');
+const fmtCards   = document.getElementById('fmt-cards');
+const aspectSel  = document.getElementById('aspect');
+const aspectNote = document.getElementById('aspect-note');
+const wantThumbChk = document.getElementById('want_thumbnail');
+const thumbShapeNote = document.getElementById('thumb-shape-note');
+const targetLen  = document.getElementById('target_len');
+const targetLenVal = document.getElementById('target-len-val');
+const lengthHint = document.getElementById('length-hint');
+const rangesTotal = document.getElementById('ranges-total');
+const rangesNote = document.getElementById('ranges-note');
+const whisperWrap = document.getElementById('whisper-wrap');
+const silenceWrap = document.getElementById('silence-wrap');
+const musicNote  = document.getElementById('music-note');
+const submitHint = document.getElementById('submit-hint');
+const selSelection = document.getElementById('sel_selection');
+const selVoice     = document.getElementById('sel_voice');
+const axisNote     = document.getElementById('axis-note');
+const axesDetails  = document.getElementById('axes-details');
+const narrateLevelWrap  = document.getElementById('narrate-level-wrap');
+const dialogueLevelWrap = document.getElementById('dialogue-level-wrap');
+const narrateKind       = document.getElementById('narrate-kind');
+const scriptFieldset    = document.getElementById('script-fieldset');
+const rangesWrap        = document.getElementById('ranges-wrap');
+const dialogueVol       = document.getElementById('dialogue_volume');
+const dialogueVolVal    = document.getElementById('dvolume-val');
+const nVolLabel         = document.getElementById('nvol-label');
 const suggestModel = document.getElementById('suggest_model');
 const useSrtWrap = document.getElementById('use-srt-wrap');
 const useSrtChk  = document.getElementById('use_srt');
@@ -1543,35 +2144,271 @@ function syncBgMode() {
   // Volume + skip-intro only matter when background music is actually on.
   bgAudioOpts.style.display = bgMode.value === 'none' ? 'none' : 'block';
 }
-bgMode.addEventListener('change', syncBgMode);
+bgMode.addEventListener('change', () => { syncBgMode(); syncMusicNote(); });
 syncBgMode();
-bgVolume.addEventListener('input', () => { volumeVal.textContent = bgVolume.value; });
-nVolume.addEventListener('input', () => { nVolumeVal.textContent = nVolume.value; });
-narrateChk.addEventListener('change', () => {
-  narrateOpts.style.display = narrateChk.checked ? 'block' : 'none';
-});
+let bgVolTouched = false;
+bgVolume.addEventListener('input', () => { bgVolTouched = true; volumeVal.textContent = bgVolume.value; });
+let nVolTouched = false;
+nVolume.addEventListener('input', () => { nVolTouched = true; nVolumeVal.textContent = nVolume.value; });
+dialogueVol.addEventListener('input', () => { dialogueVolVal.textContent = dialogueVol.value; });
 
-// ── Format selector: show/hide + require the right widgets per mode ──────────
+// ── Output shape drives geometry, clip length, and the thumbnail canvas ──────
+// It is one decision, not three: a 9:16 Short and a 16:9 long-form upload want
+// different clip lengths AND differently-shaped thumbnails.
+const SHAPES = {
+  vertical:  {name: '9:16 vertical',  thumb: [1080, 1920], short: true},
+  square:    {name: '1:1 square',     thumb: [1080, 1080], short: true},
+  landscape: {name: '16:9 landscape', thumb: [1920, 1080], short: false},
+};
+const SHORT_CAP = 180;   // YouTube stops calling it a Short past three minutes
+
+// A preset is a named POINT in the selection x voice x shape space, not a type.
+// Everything below branches on the axes; nothing branches on the preset name.
+const PRESETS = {
+  narrated:     {selection: 'manual', voice: 'commentary',   shape: 'vertical'},
+  storytelling: {selection: 'script', voice: 'storytelling', shape: 'landscape'},
+  recap:        {selection: 'spine',  voice: 'music',        shape: 'vertical'},
+  classic:      {selection: 'manual', voice: 'none',         shape: 'square'},
+};
+const sel   = () => selSelection.value;
+const voice = () => selVoice.value;
+// Derived facts — the same ones main.py computes.
+const narrationLed = () => voice() === 'storytelling';   // script sets clip length
+const autoRanges   = () => sel() === 'spine' || sel() === 'script';
+const needsSubs    = () => autoRanges() || sel() === 'scene';
+
+function applyPreset(name) {
+  const p = PRESETS[name];
+  if (!p) return;
+  selSelection.value = p.selection;
+  selVoice.value = p.voice;
+  aspectSel.value = p.shape;
+}
+// Which preset (if any) the current axes spell out — so hand-tuning the axes
+// lights up the matching card instead of pretending nothing changed.
+function matchPreset() {
+  for (const [name, p] of Object.entries(PRESETS)) {
+    if (p.selection === sel() && p.voice === voice() && p.shape === aspectSel.value) return name;
+  }
+  return 'custom';
+}
+
+function shapeKey() {
+  return aspectSel.value || 'vertical';
+}
+function shapeInfo() { return SHAPES[shapeKey()] || SHAPES.vertical; }
+
+function fmtDur(sec) {
+  sec = Math.round(sec);
+  if (sec < 60) return sec + 's';
+  return Math.floor(sec / 60) + ':' + String(sec % 60).padStart(2, '0');
+}
+
+// ── Target length ───────────────────────────────────────────────────────────
+// One control, two meanings: for a single-scene edit it is the length the scene
+// AI aims for; for a recap it is the total body length before the outro. The
+// bounds follow the output shape — minutes for long-form, seconds for a Short.
+function lengthBounds() {
+  const long = !shapeInfo().short;
+  const recap = autoRanges();
+  if (long)  return {min: 120, max: 900, step: 30, def: recap ? 420 : 300};
+  if (recap) return {min: 30,  max: 300, step: 10, def: 120};
+  return {min: 20, max: 180, step: 5, def: 60};
+}
+function sceneWindow() {
+  // The window handed to the scene AI, either side of the target.
+  const v = parseFloat(targetLen.value) || lengthBounds().def;
+  return [Math.max(5, Math.round(v * 0.7)), Math.round(v * 1.4)];
+}
+let lengthTouched = false;
+function syncLength() {
+  const b = lengthBounds();
+  targetLen.min = b.min; targetLen.max = b.max; targetLen.step = b.step;
+  let v = lengthTouched ? parseFloat(targetLen.value) : b.def;
+  if (!isFinite(v)) v = b.def;
+  v = Math.min(b.max, Math.max(b.min, Math.round(v / b.step) * b.step));
+  targetLen.value = v;
+  targetLenVal.textContent = fmtDur(v);
+  const w = sceneWindow();
+  // Both ends of a range share one unit — "42s–1:24" reads as a typo.
+  const mmss = (t) => Math.floor(t / 60) + ':' + String(Math.round(t) % 60).padStart(2, '0');
+  const pair = Math.max(w[0], w[1]) >= 60
+    ? mmss(w[0]) + '–' + mmss(w[1])
+    : w[0] + '–' + w[1] + 's';
+  lengthHint.innerHTML = autoRanges()
+    ? 'The recap body aims for <strong>' + fmtDur(v) + '</strong> of cuts before the outro.'
+    : 'Scene suggestions will aim for <strong>' + pair + '</strong>.';
+}
+targetLen.addEventListener('input', () => { lengthTouched = true; syncLength(); });
+
+// ── Live total of the picked ranges ─────────────────────────────────────────
+function syncRangesTotal() {
+  let total = 0, n = 0;
+  for (const row of rangesEl.children) {
+    const s = parseTs(row.querySelector('.r-start').value);
+    const e = parseTs(row.querySelector('.r-end').value);
+    if (s == null || e == null || e <= s) continue;
+    total += e - s; n++;
+  }
+  const over = shapeInfo().short && total > SHORT_CAP;
+  rangesTotal.textContent = n ? (n + (n > 1 ? ' clips · ' : ' clip · ') + fmtDur(total)) : '';
+  rangesTotal.classList.toggle('over', over);
+  const notes = [];
+  if (autoRanges() && !n) {
+    notes.push('Empty = recap the whole film. One long range scopes it to that stretch.');
+  }
+  if (over) {
+    notes.push('Past the ' + fmtDur(SHORT_CAP) + ' Shorts limit — YouTube will treat this as a regular video.');
+  }
+  rangesNote.innerHTML = notes.join('<br>');
+}
+rangesEl.addEventListener('input', syncRangesTotal);
+
+// ── Music note: what a track does (or does not do) in this mode ─────────────
+function syncMusicNote() {
+  const v = voice(), m = bgMode.value;
+  let msg = '', wantVol = '0.10';
+  if (v === 'music') {
+    msg = m === 'none'
+      ? 'Nothing is carrying this edit — pick a track, or switch the voice above to dialogue or a narrator.'
+      : 'The music leads: cuts snap to its beats and the dialogue ducks underneath it.';
+    if (m !== 'none') wantVol = '0.60';
+  } else if (v === 'storytelling') {
+    msg = m === 'none'
+      ? 'The narrator leads and the dialogue sits under them. Music is optional here — a quiet bed is typical.'
+      : 'Keep this low: it sits under the narrator alongside the dialogue.';
+    if (m !== 'none') wantVol = '0.10';
+  } else if (v === 'commentary' && m !== 'none') {
+    msg = 'Movie audio + voiceover + music gets muddy fast — keep this low.';
+  }
+  // Only move the slider while the user hasn't touched it, so a hand-set level sticks.
+  if (!bgVolTouched && bgVolume.value !== wantVol) {
+    bgVolume.value = wantVol;
+    volumeVal.textContent = bgVolume.value;
+  }
+  musicNote.innerHTML = msg;
+}
+
+// ── Axis sync: every widget follows the three axes, never a preset name ─────
 function syncFormat() {
-  const f = formatSel.value;
-  narrateFieldset.style.display = f === 'narrated' ? 'block' : 'none';
-  recapFieldset.style.display = f === 'recap' ? 'block' : 'none';
-  // The narrate checkbox is the legacy switch main.py still reads — keep it in
-  // sync with the selector so the payload is unambiguous.
-  narrateChk.checked = (f === 'narrated');
-  narrateOpts.style.display = (f === 'narrated') ? 'block' : 'none';
-  // Recap is cut to one hand-picked track — force "Specific file" mode.
-  if (f === 'recap' && bgMode.value !== 'file') { bgMode.value = 'file'; syncBgMode(); }
-  // Edit-style description is the default for recap edits.
-  if (f === 'recap') { editCreditsChk.checked = true; syncEditCredits(); }
+  const s = sel(), v = voice(), led = narrationLed();
+
+  // Light the card whose point in the space this is (or none, when custom).
+  const preset = matchPreset();
+  formatSel.value = preset;
+  for (const card of fmtCards.querySelectorAll('.fmt')) {
+    card.setAttribute('aria-pressed', String(card.dataset.value === preset));
+  }
+  if (preset === 'custom') axesDetails.open = true;
+
+  // Voice decides which narration controls apply. Storytelling and commentary
+  // are different agents with different mixes, so they get different copy.
+  const anyVoice = v === 'commentary' || v === 'storytelling';
+  document.getElementById('audio-mix-wrap').style.display = v === 'commentary' ? '' : 'none';
+  const mixLed = led || (v === 'commentary' && document.getElementById('audio_mix').value !== 'original');
+  narrateFieldset.style.display = anyVoice ? '' : 'none';
+  narrateChk.checked = v === 'commentary';   // legacy flag main.py still reads
+  narrateLevelWrap.style.display = anyVoice ? '' : 'none';
+  // Commentary sits UNDER a film at full volume; a storytelling narrator IS the
+  // lead. Same control, two different working levels.
+  nVolLabel.textContent = led ? 'Narrator level' : 'Voiceover volume';
+  if (!nVolTouched) {
+    nVolume.value = mixLed ? '1' : '0.04';
+    nVolumeVal.textContent = parseFloat(nVolume.value).toFixed(2);
+  }
+  dialogueLevelWrap.style.display = mixLed ? '' : 'none';
+  narrateKind.innerHTML = mixLed
+    ? 'The narrator is the <strong>lead track</strong> and retells the plot; the film’s dialogue is pulled down and ducks under them. Their lines render as a lower third.'
+    : 'The voiceover sits <strong>under</strong> the film at low volume and comments on the moment. Its text shows in the band beneath the video.';
+
+  // Selection decides which agent picks the clips.
+  recapFieldset.style.display = s === 'spine' ? '' : 'none';
+  scriptFieldset.style.display = s === 'script' ? '' : 'none';
+  rangesWrap.style.display = s === 'script' ? 'none' : '';
+
+  // Whisper only ever runs without usable subtitles, and every selection agent
+  // needs the subtitle file outright.
+  whisperWrap.style.display = (needsSubs() || (probedSrt && useSrtChk.checked)) ? 'none' : '';
+  // Silence removal would desync agent-picked cuts from their captions.
+  silenceWrap.style.display = autoRanges() ? 'none' : '';
+  // Edit-style credits are the norm for multi-clip agent edits.
+  if (autoRanges() && !editCreditsTouched && !editCreditsChk.checked) {
+    editCreditsChk.checked = true;
+    syncEditCredits();
+  }
+
+  aiBtn.textContent = s === 'spine'
+    ? '🎬 Build recap beats from subtitles'
+    : '✨ Suggest scenes from subtitles';
+  aiHint.innerHTML = s === 'spine'
+    ? 'The whole plot goes to the model; it comes back as an ordered beat list, loaded into the ranges above. Can take a minute.'
+    : 'The whole subtitle file goes to the model; it comes back with clip ranges you can click to add.';
+  aiBtn.style.display = s === 'script' ? 'none' : '';
+  if (s === 'script') {
+    aiHint.innerHTML = 'The script itself picks the clips at render time — there is nothing to preview here yet.';
+  }
+
+  axisNote.innerHTML = led
+    ? 'Narration-led: the script is written and spoken first, then each clip is cut to last exactly as long as its line.'
+    : 'Clip-led: the ranges fix the length, and anything spoken is fitted inside them.';
+
+  syncShape();
+  syncLength();
+  syncMusicNote();
+  syncRangesTotal();
   submitLabel();
 }
-formatSel.addEventListener('change', syncFormat);
+
+// ── Shape + thumbnail notes ────────────────────────────────────────────────
+let cropTargetAspect = 9 / 16;   // read by the thumbnail crop-box, further down
+let cropReady = false;
+function syncShape() {
+  const sh = shapeInfo();
+  const w = sh.thumb[0], h = sh.thumb[1];
+  // Shape is free in every combination now — the only thing worth saying is what
+  // the choice implies for length and for the thumbnail.
+  aspectNote.classList.remove('lock');
+  aspectNote.innerHTML = sh.short
+    ? 'Short-form: stay under ' + fmtDur(SHORT_CAP) + ' to keep it a Short.'
+    : 'Long-form: no ' + fmtDur(SHORT_CAP) + ' limit, and the thumbnail is composed 16:9.';
+  if (voice() === 'commentary' && !sh.short) {
+    aspectNote.innerHTML += '<br>Commentary text renders as a lower third here — there is no band to put it in.';
+  }
+
+  // Narration-led rendering can't be cut ahead of time: the clips don't exist
+  // until the script has been spoken and measured.
+  const canPick = !narrationLed();
+  wantThumbChk.disabled = !canPick;
+  thumbShapeNote.innerHTML = !canPick
+    ? 'Not available for a narration-led edit — the clips don’t exist until the script has been spoken. A <strong>'
+      + w + '×' + h + '</strong> thumbnail is composed automatically.'
+    : (wantThumbChk.checked
+        ? 'Cut first, scrub to the frame you want, then render. Composed at <strong>'
+          + w + '×' + h + '</strong> for the ' + sh.name + ' output.'
+        : 'Off — renders in a single pass and composes a <strong>' + w + '×' + h
+          + '</strong> thumbnail automatically.');
+  cropTargetAspect = w / h;
+  refreshCropbox();
+}
+wantThumbChk.addEventListener('change', () => { syncShape(); submitLabel(); });
+aspectSel.addEventListener('change', () => { syncFormat(); });
+
+// ── Cards set all three axes at once; the axes themselves stay editable ─────
+fmtCards.addEventListener('click', (e) => {
+  const card = e.target.closest('.fmt');
+  if (!card) return;
+  applyPreset(card.dataset.value);
+  syncFormat();
+});
+selSelection.addEventListener('change', syncFormat);
+selVoice.addEventListener('change', syncFormat);
+document.getElementById('audio_mix').addEventListener('change', syncFormat);
 
 // ── Edit-style description credits ──────────────────────────────────────────
 const editCreditsChk = document.getElementById('edit_credits');
 const editCreditsOpts = document.getElementById('edit-credits-opts');
 const musicCreditInput = document.getElementById('music_credit');
+let editCreditsTouched = false;
 function cleanMusicName(fn) {
   return (fn || '').replace(/\\.[A-Za-z0-9]+$/, '').replace(/^\\s*\\d+[\\.\\)\\-\\s]+/, '')
     .replace(/_/g, ' ').replace(/\\s+/g, ' ').trim();
@@ -1583,39 +2420,74 @@ function syncEditCredits() {
     musicCreditInput.value = cleanMusicName(bgFileSel.value);
   }
 }
-editCreditsChk.addEventListener('change', syncEditCredits);
+editCreditsChk.addEventListener('change', () => { editCreditsTouched = true; syncEditCredits(); });
 bgFileSel.addEventListener('change', () => {
   if (editCreditsChk.checked && !musicCreditInput.value.trim()) {
     musicCreditInput.value = cleanMusicName(bgFileSel.value);
   }
 });
 
-// Recap sliders + outro toggle
-const recapTarget = document.getElementById('recap_target');
-const recapTargetVal = document.getElementById('recap-target-val');
-recapTarget.addEventListener('input', () => { recapTargetVal.textContent = recapTarget.value; });
+// ── Recap outro ────────────────────────────────────────────────────────────
 const outroSec = document.getElementById('outro_seconds');
 const outroSecVal = document.getElementById('outro-sec-val');
-outroSec.addEventListener('input', () => { outroSecVal.textContent = outroSec.value; });
+outroSec.addEventListener('input', () => { outroSecVal.textContent = outroSec.value + 's'; });
 const recapOutroChk = document.getElementById('recap_outro');
 recapOutroChk.addEventListener('change', () => {
   document.getElementById('recap-outro-opts').style.display = recapOutroChk.checked ? 'block' : 'none';
 });
 
-// Build the whole recap's ranges from the subtitles in one click.
-document.getElementById('recap-build-btn').addEventListener('click', async () => {
-  const statusEl = document.getElementById('recap-build-status');
-  if (!(useSrtChk.checked && probedSrt)) {
-    statusEl.style.color = 'var(--err)';
-    statusEl.textContent = 'Check subtitles first — recap reads the whole .srt.';
-    return;
+// ── One AI button, whichever edit you are cutting ───────────────────────────
+// Both jobs read the same subtitle file with the same model; only the shape of
+// the answer differs, so they belong on the same control.
+function aiBusy(on, label) {
+  aiBtn.disabled = on;
+  aiBtn.textContent = on ? label : (sel() === 'spine'
+    ? '🎬 Build recap beats from subtitles'
+    : '✨ Suggest scenes from subtitles');
+}
+function aiSay(msg, bad) {
+  aiStatus.style.color = bad ? 'var(--err)' : 'var(--text-faint)';
+  aiStatus.textContent = msg || '';
+}
+function subtitleModel() {
+  return suggestModel.value === '__cloud__'
+    ? document.getElementById('ollama_model').value.trim()
+    : suggestModel.value;
+}
+
+async function runSceneSuggest() {
+  const w = sceneWindow();
+  curatedRegion = null;   // a fresh set of scenes invalidates any prior curation
+  aiBusy(true, '⏳ Reading the subtitles…');
+  aiSay('');
+  suggestionsEl.innerHTML = '';
+  try {
+    const res = await fetch(BASE_PATH + '/suggest-scenes', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({
+        srt: probedSrt,
+        title: document.getElementById('source_title').value.trim(),
+        model: subtitleModel(),
+        count: 5,
+        min_seconds: w[0],
+        max_seconds: w[1],
+      }),
+    });
+    if (!res.ok) throw new Error(await res.text() || res.statusText);
+    const d = await res.json();
+    renderSuggestions(d.scenes || []);
+  } catch (err) {
+    suggestionsEl.innerHTML = '<div class="suggestion" style="cursor:default;color:var(--err)">Suggestion failed: '
+      + String(err.message).slice(0, 300) + '</div>';
+  } finally {
+    aiBusy(false);
   }
-  const btn = document.getElementById('recap-build-btn');
-  btn.disabled = true;
-  const oldText = btn.textContent;
-  btn.textContent = '⏳ Reading the whole plot… (can take a minute)';
-  statusEl.style.color = 'var(--text-faint)';
-  statusEl.textContent = '';
+}
+
+async function runRecapBuild() {
+  aiBusy(true, '⏳ Reading the whole plot… (can take a minute)');
+  aiSay('');
   try {
     const res = await fetch(BASE_PATH + '/build-recap', {
       method: 'POST',
@@ -1623,44 +2495,62 @@ document.getElementById('recap-build-btn').addEventListener('click', async () =>
       body: JSON.stringify({
         srt: probedSrt,
         title: document.getElementById('source_title').value.trim(),
-        model: suggestModel.value === '__cloud__'
-          ? document.getElementById('ollama_model').value.trim()
-          : suggestModel.value,
-        target_seconds: parseInt(recapTarget.value, 10),
+        model: subtitleModel(),
+        target_seconds: parseInt(targetLen.value, 10),
       }),
     });
     if (!res.ok) throw new Error(await res.text() || res.statusText);
     const d = await res.json();
-    const beats = d.beats || [];
-    if (!beats.length) { statusEl.textContent = 'No recap beats came back — try a different model.'; return; }
-    // Replace every range row with the recap beats, in order.
+    const beats = d.beats || d.scenes || [];
+    if (!beats.length) { aiSay('No recap beats came back — try a different model.', true); return; }
     rangesEl.innerHTML = '';
     for (const b of beats) {
-      const [s, e] = b.range.split('-');
+      const [s, e] = (b.range || '').split('-');
       addRangeRow(s, e);
     }
     const total = beats.reduce((a, b) => a + (b.end - b.start), 0);
-    statusEl.textContent = `${beats.length} beats loaded (~${Math.round(total)}s). Pick a music track, then build.`;
+    syncRangesTotal();
+    aiSay(beats.length + ' beats loaded (~' + fmtDur(total) + '). Tweak them above, then render.');
   } catch (err) {
-    statusEl.style.color = 'var(--err)';
-    statusEl.textContent = 'Recap build failed: ' + String(err.message).slice(0, 300);
+    aiSay('Recap build failed: ' + String(err.message).slice(0, 300), true);
   } finally {
-    btn.disabled = false;
-    btn.textContent = oldText;
+    aiBusy(false);
   }
+}
+
+aiBtn.addEventListener('click', () => {
+  if (!(useSrtChk.checked && probedSrt)) {
+    aiSay('Needs a subtitle file — none is selected for this movie.', true);
+    return;
+  }
+  return sel() === 'spine' ? runRecapBuild() : runSceneSuggest();
 });
 
-// ── SRT probe + scene suggestions ──────────────────────────────────────────
+// ── SRT probe ──────────────────────────────────────────────────────────────
+// Auto-runs whenever the path settles, so the subtitle options are simply
+// THERE when a subtitle file exists, in every mode — rather than hiding behind
+// a button you had to know to press.
+let probeSeq = 0;
+let probeTimer = null;
+
+function showNoSrt(msg, cls) {
+  probedSrt = null;
+  useSrtWrap.style.display = 'none';
+  suggestWrap.style.display = 'none';
+  subsNone.style.display = '';
+  suggestionsEl.innerHTML = '';
+  srtStatus.className = cls || '';
+  srtStatus.textContent = msg;
+  syncFormat();
+}
 
 async function probeVideo() {
-  probedSrt = null;
-  suggestWrap.style.display = 'none';
-  useSrtWrap.style.display = 'none';
-  suggestionsEl.innerHTML = '';
-  srtStatus.className = '';
+  const seq = ++probeSeq;
   const video = videoInput.value.trim();
-  if (!video) { srtStatus.textContent = 'Enter a movie file path first.'; return; }
-  srtStatus.textContent = 'Checking for a subtitle file…';
+  suggestionsEl.innerHTML = '';
+  if (!video) { showNoSrt('Paste a movie path — subtitles are looked up automatically.'); return; }
+  srtStatus.className = '';
+  srtStatus.textContent = 'Looking for a subtitle file…';
   checkSrtBtn.disabled = true;
   try {
     const res = await fetch(BASE_PATH + '/probe-video', {
@@ -1669,25 +2559,29 @@ async function probeVideo() {
       body: JSON.stringify({video}),
     });
     const d = await res.json();
-    if (!d.exists) {
-      srtStatus.textContent = '⚠ file not found at that path';
-      return;
-    }
+    if (seq !== probeSeq) return;   // a newer probe already answered
+    if (!d.exists) { showNoSrt('⚠ No file at that path.', 'missing'); return; }
+    if (typeof d.duration === 'number' && d.duration > 0) setSpanBounds(d.duration);
     if (d.srt) {
       probedSrt = d.srt;
       srtStatus.className = 'found';
-      srtStatus.textContent = '✓ subtitles found: ' + d.srt.split(/[\\\\/]/).pop();
+      srtStatus.textContent = '✓ Subtitles found: ' + d.srt.split(/[\\\\/]/).pop();
       useSrtWrap.style.display = 'flex';
       suggestWrap.style.display = 'block';
+      subsNone.style.display = 'none';
+      syncFormat();
     } else {
-      srtStatus.textContent = 'no .srt found next to the movie — Whisper will transcribe';
+      showNoSrt('No .srt next to the movie — Whisper will transcribe instead.', 'missing');
     }
   } catch (err) {
-    srtStatus.textContent = 'Could not check (' + String(err.message).slice(0, 120) + ')';
+    if (seq !== probeSeq) return;
+    showNoSrt('Could not check (' + String(err.message).slice(0, 120) + ')', 'missing');
   } finally {
     checkSrtBtn.disabled = false;
   }
 }
+useSrtChk.addEventListener('change', syncFormat);
+
 // Some iOS paste targets deliver a copied path URL-encoded ('\\' as %5C,
 // ' ' as %20). Decode in place so the user sees the real path immediately.
 function normalizePathInput() {
@@ -1700,43 +2594,18 @@ function normalizePathInput() {
   }
   if (v !== videoInput.value) videoInput.value = v;
 }
-videoInput.addEventListener('input', normalizePathInput);
-videoInput.addEventListener('paste', () => setTimeout(normalizePathInput, 0));
-
-checkSrtBtn.addEventListener('click', probeVideo);
-// Re-checking whenever the path changes keeps stale results from lingering.
-videoInput.addEventListener('change', () => { probedSrt = null; suggestWrap.style.display = 'none';
-  useSrtWrap.style.display = 'none'; suggestionsEl.innerHTML = ''; srtStatus.className = '';
-  srtStatus.textContent = 'Click “Check subtitles” to look for a matching .srt.'; });
-
-suggestBtn.addEventListener('click', async () => {
-  suggestBtn.disabled = true;
-  suggestBtn.textContent = '⏳ Analyzing subtitles… (can take a minute)';
-  suggestionsEl.innerHTML = '';
-  try {
-    const res = await fetch(BASE_PATH + '/suggest-scenes', {
-      method: 'POST',
-      headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({
-        srt: probedSrt,
-        title: document.getElementById('source_title').value.trim(),
-        model: suggestModel.value === '__cloud__'
-          ? document.getElementById('ollama_model').value.trim()
-          : suggestModel.value,
-        count: 5,
-      }),
-    });
-    if (!res.ok) throw new Error(await res.text() || res.statusText);
-    const d = await res.json();
-    renderSuggestions(d.scenes || []);
-  } catch (err) {
-    suggestionsEl.innerHTML = '<div class="suggestion" style="cursor:default;color:var(--err)">Suggestion failed: '
-      + String(err.message).slice(0, 300) + '</div>';
-  } finally {
-    suggestBtn.disabled = false;
-    suggestBtn.textContent = '✨ Suggest scenes from subtitles';
-  }
+videoInput.addEventListener('input', () => {
+  normalizePathInput();
+  clearTimeout(probeTimer);
+  probeTimer = setTimeout(probeVideo, 600);
 });
+videoInput.addEventListener('paste', () => setTimeout(() => {
+  normalizePathInput();
+  clearTimeout(probeTimer);
+  probeTimer = setTimeout(probeVideo, 150);
+}, 0));
+videoInput.addEventListener('change', () => { clearTimeout(probeTimer); probeVideo(); });
+checkSrtBtn.addEventListener('click', () => { clearTimeout(probeTimer); probeVideo(); });
 
 function renderSuggestions(scenes) {
   suggestionsEl.innerHTML = '';
@@ -1747,26 +2616,67 @@ function renderSuggestions(scenes) {
   for (const sc of scenes) {
     const card = document.createElement('div');
     card.className = 'suggestion';
+    card.dataset.range = sc.range;
     card.innerHTML = `
-      <div class="s-head"><span>${sc.title || 'Scene'}</span><span class="s-range">${sc.range}</span></div>
+      <div class="s-head">
+        <label style="display:flex;gap:8px;align-items:center;cursor:pointer;min-width:0">
+          <input type="checkbox" class="s-tick" style="accent-color:var(--accent);flex-shrink:0">
+          <span style="overflow:hidden;text-overflow:ellipsis">${sc.title || 'Scene'}</span>
+        </label>
+        <span class="s-range">${sc.range}</span>
+      </div>
       <div class="s-reason">${sc.reason || ''}</div>
+      <button type="button" class="mini-btn s-add" style="margin-top:6px">+ add as clip range</button>
     `;
-    card.title = 'Click to add as a clip range';
-    card.onclick = () => {
+    // Ticking a scene marks it for the curated recap region; the button adds it
+    // as a literal clip range (the old behaviour).
+    card.querySelector('.s-tick').addEventListener('change', updateCurationBar);
+    card.querySelector('.s-add').onclick = () => {
       const [s, e] = sc.range.split('-');
-      // Reuse the first empty range row before adding a new one
       const empty = [...rangesEl.children].find(r =>
         !r.querySelector('.r-start').value.trim() && !r.querySelector('.r-end').value.trim());
-      if (empty) {
-        empty.querySelector('.r-start').value = s;
-        empty.querySelector('.r-end').value = e;
-      } else {
-        addRangeRow(s, e);
-      }
+      if (empty) { empty.querySelector('.r-start').value = s; empty.querySelector('.r-end').value = e; }
+      else { addRangeRow(s, e); }
       card.classList.add('added');
     };
     suggestionsEl.appendChild(card);
   }
+  // Curation bar: tick scenes → build the recap within just those.
+  const bar = document.createElement('div');
+  bar.id = 'curation-bar';
+  bar.style = 'margin-top:10px';
+  bar.innerHTML = `
+    <button type="button" id="use-ticked" class="mini-btn primary" style="width:100%">🎬 Use ticked scenes as the recap region</button>
+    <div id="curation-note" class="note"></div>`;
+  suggestionsEl.appendChild(bar);
+  bar.querySelector('#use-ticked').onclick = useTickedScenes;
+  updateCurationBar();
+}
+
+function tickedSceneRanges() {
+  return [...suggestionsEl.querySelectorAll('.suggestion')]
+    .filter(c => { const t = c.querySelector('.s-tick'); return t && t.checked; })
+    .map(c => c.dataset.range);
+}
+function updateCurationBar() {
+  const n = tickedSceneRanges().length;
+  const note = document.getElementById('curation-note');
+  if (note) note.textContent = n
+    ? `${n} scene(s) ticked — the recap will pick connecting beats within only these.`
+    : 'Tick the scenes you like, then build the recap within just them.';
+}
+// Ticked scenes → the recap region. Sets Recap format so the picker runs, and
+// stores the region for buildPayload; the user then sets target + hits Build.
+let curatedRegion = null;
+function useTickedScenes() {
+  const ranges = tickedSceneRanges();
+  if (!ranges.length) { updateCurationBar(); return; }
+  curatedRegion = ranges.join('; ');
+  const recapCard = fmtCards.querySelector('.fmt[data-value="recap"]');
+  if (recapCard) recapCard.click();          // switch to the recap (spine) preset
+  const note = document.getElementById('curation-note');
+  if (note) note.innerHTML = `<strong>Recap region set to ${ranges.length} ticked scene(s).</strong> `
+    + 'Set the target length, then hit Build — it will connect beats within only these.';
 }
 
 fetch(BASE_PATH + '/audio-files').then(r => r.json()).then(files => {
@@ -1900,7 +2810,17 @@ const thumbVideo = document.getElementById('thumb-video');
 const thumbCropbox = document.getElementById('thumb-cropbox');
 const thumbPan = document.getElementById('thumb-pan');
 const thumbPanVal = document.getElementById('thumb-pan-val');
-let cropWidthFrac = 1;   // width of the 9:16 window as a fraction of the frame width
+let cropWidthFrac = 1;   // width of the crop window as a fraction of the frame width
+
+// Recompute the crop window whenever either input changes: the source frame's
+// aspect, or the target thumbnail's (which follows the output shape — a 16:9
+// long-form thumbnail crops almost nothing, a 9:16 Short crops a tall slice).
+function refreshCropbox() {
+  if (!cropReady || !thumbVideo.videoWidth) return;
+  const srcAspect = thumbVideo.videoWidth / thumbVideo.videoHeight;
+  cropWidthFrac = Math.min(1, cropTargetAspect / srcAspect);
+  updateCropbox();
+}
 
 function updateCropbox() {
   const pan = parseFloat(thumbPan.value) / 100;
@@ -1915,10 +2835,8 @@ function updateCropbox() {
 }
 thumbPan.addEventListener('input', updateCropbox);
 thumbVideo.addEventListener('loadedmetadata', () => {
-  const aspect = thumbVideo.videoWidth / thumbVideo.videoHeight;
-  // A 9:16 window is (9/16)/aspect of the frame's width.
-  cropWidthFrac = Math.min(1, (9 / 16) / aspect);
-  updateCropbox();
+  cropReady = true;
+  refreshCropbox();
 });
 
 // ── Title options ───────────────────────────────────────────────────────────
@@ -2095,6 +3013,8 @@ async function grabThumbnail() {
         movie: document.getElementById('thumb-movie').value.trim(),
         font: document.getElementById('thumb-font').value,
         color: document.getElementById('thumb-color').value,
+        width: shapeInfo().thumb[0],
+        height: shapeInfo().thumb[1],
         ...enhancePayload(),
       }),
     });
@@ -2117,14 +3037,23 @@ async function grabThumbnail() {
 document.getElementById('thumb-grab').addEventListener('click', grabThumbnail);
 
 function buildPayload(ranges, usePrepared) {
+  const spanOn = document.getElementById('span_enable') && document.getElementById('span_enable').checked;
   return {
     video: document.getElementById('video').value.trim(),
     ranges,
     source_title: document.getElementById('source_title').value.trim(),
-    // Blank = let the LLM write it during the metadata step, as before.
-    title: document.getElementById('thumb-title').value.trim(),
+    // Movie span (only when enabled) + hook + speech-snap toggle.
+    span_start: spanOn ? parseFloat(document.getElementById('span_start').value) : null,
+    curated_region: (typeof curatedRegion !== 'undefined' ? curatedRegion : null),
+    span_end: spanOn ? parseFloat(document.getElementById('span_end').value) : null,
+    hook: document.getElementById('hook').checked,
+    no_snap_speech: !document.getElementById('snap_speech').checked,
+    // Only a prepared thumbnail's title is an intentional override. The
+    // completed result also fills this field and must not title the next run.
+    title: usePrepared ? document.getElementById('thumb-title').value.trim() : '',
     whisper_model: document.getElementById('whisper_model').value,
     ollama_model: document.getElementById('ollama_model').value.trim(),
+    editorial_file: document.getElementById('editorial_file').value.trim(),
     watermark: document.getElementById('watermark').value,
     bg_mode: bgMode.value,
     bg_music: bgFileSel.value,
@@ -2132,19 +3061,25 @@ function buildPayload(ranges, usePrepared) {
     bg_skip: parseFloat(document.getElementById('bg_skip').value) || 0,
     size: parseInt(document.getElementById('size').value, 10),
     language: document.getElementById('language').value.trim(),
+    // The axes are what the pipeline branches on; `mode` rides along only as the
+    // preset label for logging.
     mode: formatSel.value,
+    selection: sel(),
+    voice: voice(),
     narrate: narrateChk.checked,
+    dialogue_volume: parseFloat(dialogueVol.value),
+    audio_mix: voice() === 'commentary' ? document.getElementById('audio_mix').value : null,
     narration_volume: parseFloat(nVolume.value),
+    end_card: document.getElementById('end_card').checked,
+    end_card_duration: parseFloat(document.getElementById('end_card_duration').value),
     tts_voice: document.getElementById('tts_voice').value,
     // Recap-only options (ignored by the server for other modes).
     outro_seconds: parseFloat(outroSec.value),
     no_outro: !recapOutroChk.checked,
     auto_outro_shots: parseInt(document.getElementById('auto_outro_shots').value, 10) || 0,
     outro_shots: document.getElementById('outro_shots_manual').value.trim(),
-    target_seconds: parseInt(recapTarget.value, 10),
-    recap_model: suggestModel.value === '__cloud__'
-      ? document.getElementById('ollama_model').value.trim()
-      : suggestModel.value,
+    target_seconds: parseInt(targetLen.value, 10),
+    recap_model: subtitleModel(),
     // Edit-style description credits.
     edit_credits: editCreditsChk.checked,
     music_credit: musicCreditInput.value.trim(),
@@ -2156,9 +3091,21 @@ function buildPayload(ranges, usePrepared) {
     prepared_dir: usePrepared ? preparedDir : null,
     prepared_ranges: usePrepared ? preparedRanges : null,
     remove_silence: document.getElementById('remove_silence').checked,
+    no_loudnorm: !document.getElementById('loudnorm').checked,
     mirror: document.getElementById('mirror').checked,
-    aspect: document.getElementById('aspect').value,
+    // shapeKey() already resolves the narrated lock, so the server never has to
+    // silently override what the form said.
+    aspect: shapeKey(),
+    // Two SEPARATE decisions that used to be one checkbox, which is how every
+    // render silently stopped producing a thumbnail: the switch above only picks
+    // the FRAME (by hand vs automatically). Whether a thumbnail exists at all is
+    // its own opt-out, because unticking "pick it by hand" must still leave you
+    // with a thumbnail — the note under the switch promises exactly that.
+    want_thumbnail: !document.getElementById('skip_thumbnail').checked,
+    pick_thumbnail: wantThumbChk.checked,
     caption_font: document.getElementById('caption_font').value,
+    caption_font_shuffle: document.getElementById('caption_font_shuffle').checked,
+    caption_italic: document.getElementById('caption_italic').checked,
     caption_animation: document.getElementById('caption_animation').value,
     caption_shuffle: document.getElementById('caption_shuffle').checked,
     caption_color: document.getElementById('caption_color').value,
@@ -2176,45 +3123,69 @@ function buildPayload(ranges, usePrepared) {
   }
 })();
 
-// Every run is two-phase now: cut first so you can pick a thumbnail + title,
-// then render. (The narrate checkbox only controls narration, not the flow.)
+// The flow follows the thumbnail switch, not the format: hand-picking a frame
+// needs the clip cut first (two phases), and turning it off renders in one.
+const MODE_LABEL = {narrated: 'narrated clip', storytelling: 'storytelling recap',
+                    recap: 'recap', classic: 'clip', custom: 'edit'};
 function submitLabel() {
-  // Recap renders in one phase (auto thumbnail); the other formats cut first so
-  // you can hand-pick a thumbnail.
-  submitBtn.textContent = (formatSel.value === 'recap')
-    ? '🎬 Build recap video' : '① Cut clip & pick thumbnail';
+  const wantThumb = wantThumbChk.checked && !narrationLed();
+  submitBtn.textContent = wantThumb
+    ? '① Cut clip & pick thumbnail'
+    : '🎬 Render ' + (MODE_LABEL[formatSel.value] || 'edit');
+  const bits = [];
+  if (narrationLed()) {
+    bits.push('Writes the script, speaks it, then cuts each clip to its line — one pass.');
+  } else if (wantThumb) {
+    bits.push('Cuts first so you can scrub to a frame — you render in step ②.');
+    if (sel() === 'spine') {
+      bits.push('Build the beats above first; there is nothing to cut without them.');
+    }
+  } else {
+    bits.push('Renders in one pass and composes the thumbnail automatically.');
+  }
+  submitHint.innerHTML = bits.join('<br>');
 }
 submitLabel();
 syncFormat();
+probeVideo();
 
 form.addEventListener('submit', async (e) => {
   e.preventDefault();
   errorBox.style.display = 'none';
   const ranges = collectRanges();
-  // Recap is single-phase and can auto-build its own ranges from the subtitles,
-  // so it may run with none. The outro is cut inside main.py, so the two-phase
-  // prepare can't be reused — render directly.
-  if (formatSel.value === 'recap') {
-    if (!(useSrtChk.checked && probedSrt)) {
-      errorBox.style.display = 'block';
-      errorBox.textContent = 'Recap needs a subtitle file — click “Check subtitles”.';
-      return;
-    }
-    if (bgMode.value !== 'file' || !bgFileSel.value) {
-      errorBox.style.display = 'block';
-      errorBox.textContent = 'Recap needs a hand-picked music track — choose “Specific file” under “Background music” and select one.';
-      return;
-    }
-    // ranges may be '' — main.py builds the recap from the whole subtitle file.
-    await doRun(ranges, false);
+  const wantThumb = wantThumbChk.checked;
+  const fail = (msg) => { errorBox.style.display = 'block'; errorBox.textContent = msg; };
+
+  // Every selection agent reads the whole subtitle file.
+  if (needsSubs() && !(useSrtChk.checked && probedSrt)) {
+    fail('This edit needs a subtitle file — none is selected for this movie.');
     return;
   }
-  if (!ranges) {
-    errorBox.style.display = 'block';
-    errorBox.textContent = 'Add at least one valid range.';
+  // Narration-led: the clips do not exist until the script has been spoken, so
+  // there is nothing to cut ahead of time and nothing to pick a frame from.
+  if (narrationLed()) {
+    await doRun('', false);
     return;
   }
-  await doPrepare(ranges);
+  if (sel() === 'spine') {
+    // With no ranges, main.py builds the beats itself at render time. That is an
+    // LLM call, so its result cannot be cut ahead of the thumbnail picker.
+    if (wantThumb && !ranges) {
+      fail('Build the beats first (✨ above), or turn off “Pick the thumbnail by hand” to render in one pass.');
+      return;
+    }
+    await (wantThumb ? doPrepare(ranges) : doRun(ranges, false));
+    return;
+  }
+  if (!ranges && sel() !== 'scene') {
+    fail('Add at least one valid range.');
+    return;
+  }
+  if (!ranges) {          // scene: the agent picks it at render time
+    await doRun('', false);
+    return;
+  }
+  await (wantThumb ? doPrepare(ranges) : doRun(ranges, false));
 });
 
 function resetRunUi() {
@@ -2254,6 +3225,14 @@ async function doPrepare(ranges) {
         video: document.getElementById('video').value.trim(),
         ranges,
         source_title: document.getElementById('source_title').value.trim(),
+        // Phase 1 cuts on the music's beats when the music leads, so it needs
+        // the same axes the render will use.
+        mode: formatSel.value,
+        selection: sel(),
+        voice: voice(),
+        srt: (useSrtChk.checked && probedSrt) ? probedSrt : null,
+        bg_mode: bgMode.value,
+        bg_music: bgFileSel.value,
       }),
     });
     if (!res.ok) throw new Error(await res.text() || res.statusText);
@@ -2262,6 +3241,15 @@ async function doPrepare(ranges) {
     rawClipUrl = d.raw_clip_url;
     preparedDir = d.clip_dir || null;
     preparedRanges = d.prepared_ranges || ranges;
+    // A "random" recap track is rolled server-side in phase 1. Pin it, or phase 2
+    // would roll a different one, snap to different beats, and drift the captions
+    // off the very cut this thumbnail was picked from.
+    if (d.recap_music) {
+      bgMode.value = 'file';
+      bgFileSel.value = d.recap_music;
+      syncBgMode();
+      syncMusicNote();
+    }
     resultEl.style.display = 'block';
     document.getElementById('result-title').textContent = 'Pick your thumbnail, then render';
     thumbVideo.src = rawClipUrl;
@@ -2280,14 +3268,14 @@ async function doPrepare(ranges) {
   }
 }
 
-async function doRun(ranges, usePrepared) {
+async function doRun(ranges, usePrepared, overrides = {}) {
   resultEl.style.display = usePrepared ? 'block' : 'none';
   logEl.textContent = '';
   setStep(0);
   stepLabel.className = '';
   stepLabel.textContent = 'Starting…';
   wsHandledDone = false;
-  const payload = buildPayload(ranges, usePrepared);
+  const payload = Object.assign(buildPayload(ranges, usePrepared), overrides);
   submitBtn.disabled = true;
   submitBtn.textContent = 'Running…';
   const renderBtn = document.getElementById('thumb-render');
@@ -2323,6 +3311,148 @@ document.getElementById('thumb-render').addEventListener('click', async () => {
     await grabThumbnail();
   }
   doRun(ranges, true);
+});
+
+// ── Style persistence + title reset (user requests) ─────────────────────────
+// Font/style dropdowns REMEMBER the previous selection across renders; the
+// previous render's TITLE is cleared when you switch movie or format (it was
+// sticking around until a server restart).
+(function () {
+  try {
+    for (const id of ['caption_font', 'thumb-font', 'thumb-color', 'thumb-enhance']) {
+      const el = document.getElementById(id);
+      if (!el) continue;
+      const key = 'clip_pref_' + id;
+      const saved = localStorage.getItem(key);
+      if (saved !== null && [...el.options].some(o => o.value === saved)) el.value = saved;
+      el.addEventListener('change', () => { try { localStorage.setItem(key, el.value); } catch (e) {} });
+    }
+  } catch (e) {}
+
+  // Effect segmented button group → hidden #caption_animation (persisted).
+  try {
+    const grp = document.getElementById('caption_animation_btns');
+    const hidden = document.getElementById('caption_animation');
+    if (grp && hidden) {
+      const key = 'clip_pref_caption_animation';
+      const set = (val) => {
+        hidden.value = val;
+        for (const b of grp.querySelectorAll('.seg')) b.classList.toggle('active', b.dataset.value === val);
+        try { localStorage.setItem(key, val); } catch (e) {}
+      };
+      const saved = localStorage.getItem(key);
+      if (saved && grp.querySelector('.seg[data-value="' + saved + '"]')) set(saved);
+      grp.addEventListener('click', (e) => { const b = e.target.closest('.seg'); if (b) set(b.dataset.value); });
+    }
+  } catch (e) {}
+  const clearTitle = () => {
+    const t = document.getElementById('thumb-title'); if (t) t.value = '';
+    const o = document.getElementById('title-options'); if (o) o.innerHTML = '';
+  };
+  const vid = document.getElementById('video'); if (vid) vid.addEventListener('change', clearTitle);
+  const fc = document.getElementById('fmt-cards'); if (fc) fc.addEventListener('click', clearTitle);
+})();
+
+// ── Movie SPAN slider + hook/snap wiring ────────────────────────────────────
+let movieDuration = 0;
+function _fmtT(s) {
+  s = Math.max(0, Math.round(s));
+  const h = Math.floor(s / 3600), m = Math.floor(s % 3600 / 60), ss = s % 60;
+  return h ? `${h}:${String(m).padStart(2, '0')}:${String(ss).padStart(2, '0')}`
+           : `${m}:${String(ss).padStart(2, '0')}`;
+}
+function syncSpan() {
+  const a = document.getElementById('span_start'), b = document.getElementById('span_end');
+  const fv = document.getElementById('span-from-val'), tv = document.getElementById('span-to-val');
+  if (!a || !b) return;
+  if (+a.value >= +b.value - 5) a.value = Math.max(0, +b.value - 5);
+  if (fv) fv.textContent = _fmtT(+a.value);
+  if (tv) tv.textContent = (movieDuration && +b.value >= movieDuration) ? 'end' : _fmtT(+b.value);
+}
+function setSpanBounds(dur) {
+  movieDuration = dur;
+  const a = document.getElementById('span_start'), b = document.getElementById('span_end');
+  if (!a || !b) return;
+  a.max = Math.floor(dur); b.max = Math.floor(dur);
+  if (+b.value === 0 || +b.value > dur) b.value = Math.floor(dur);
+  syncSpan();
+}
+(function () {
+  const en = document.getElementById('span_enable'), wrap = document.getElementById('span-wrap');
+  if (en && wrap) en.addEventListener('change', () => { wrap.style.display = en.checked ? 'block' : 'none'; });
+  for (const id of ['span_start', 'span_end']) {
+    const el = document.getElementById(id);
+    if (el) el.addEventListener('input', syncSpan);
+  }
+  syncSpan();
+})();
+let comparisonPlan = null;
+const comparisonReview = document.getElementById('comparison-review');
+const comparisonApproved = document.getElementById('comparison-approved');
+const comparisonBuild = document.getElementById('comparison-build');
+function comparisonButtons() {
+  for (const style of ['short', 'long']) document.getElementById('comparison-' + style).disabled = !comparisonPlan || !comparisonApproved.checked;
+}
+for (const id of ['video', 'source_title', 'span_start', 'span_end', 'span_enable', 'comparison-duration', 'ollama_model', 'comparison-feedback']) {
+  document.getElementById(id).addEventListener('input', () => {
+    comparisonPlan = null; comparisonApproved.checked = false; comparisonButtons();
+    comparisonReview.textContent = 'Settings changed — build a fresh comparison plan.';
+  });
+}
+comparisonApproved.addEventListener('change', comparisonButtons);
+comparisonBuild.addEventListener('click', async () => {
+  if (submitBtn.disabled) return;
+  comparisonPlan = null; comparisonApproved.checked = false; comparisonButtons();
+  comparisonBuild.disabled = true;
+  comparisonReview.textContent = 'Establishing characters, planning the story, checking facts and extracting preview frames…';
+  try {
+    if (!document.getElementById('span_enable').checked) throw new Error('Enable a source window first.');
+    const payload = buildPayload('', false);
+    payload.target_seconds = Number(document.getElementById('comparison-duration').value);
+    payload.editorial_feedback = document.getElementById('comparison-feedback').value;
+    const res = await fetch(BASE_PATH + '/comparison-plan', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(payload)});
+    if (!res.ok) throw new Error(await res.text());
+    const job = await res.json();
+    let result;
+    do {
+      await new Promise(resolve => setTimeout(resolve, 1500));
+      const status = await fetch(BASE_PATH + '/comparison-plan/' + job.job_id);
+      if (!status.ok) throw new Error(await status.text());
+      result = await status.json();
+    } while (result.status === 'running');
+    if (result.status !== 'complete') throw new Error(result.error);
+    const plan = result.plan;
+    comparisonPlan = plan;
+    comparisonReview.textContent = plan.title + '\\n' + plan.duration + ' seconds each. Structure checks passed; inspect the attribution review below. Visual and rights review remain separate.\\n' + plan.story + '\\n\\n';
+    const notes = document.createElement('p'); notes.textContent = 'Attribution review: ' + (plan.review_notes.length ? plan.review_notes.join(' / ') : 'No model issues reported; visual confirmation still required.'); comparisonReview.appendChild(notes);
+    for (const c of plan.characters) {
+      const text = document.createElement('p');
+      text.textContent = c.name + ' — ' + c.role + ' (' + c.confidence + ') Evidence: ' + c.evidence;
+      comparisonReview.appendChild(text);
+    }
+    for (const b of plan.beats) {
+      const text = document.createElement('p');
+      text.textContent = b.role + '\\nNarration: ' + b.narration + '\\nByline: ' + b.byline + '\\nLong source: ' + b.long_start + '; short sources: ' + b.short_starts.join(', ') + '\\nEvidence: ' + b.evidence;
+      comparisonReview.appendChild(text);
+      for (const url of b.previews) {
+        const img = document.createElement('img'); img.src = url; img.alt = b.role + ' candidate frame'; img.style.width = '30%';
+        comparisonReview.appendChild(img);
+      }
+    }
+  } catch (err) { comparisonPlan = null; comparisonReview.textContent = 'Plan held: ' + err.message; }
+  finally { comparisonBuild.disabled = false; comparisonButtons(); }
+});
+for (const style of ['short', 'long']) document.getElementById('comparison-' + style).addEventListener('click', async () => {
+  if (!comparisonPlan || !comparisonApproved.checked || submitBtn.disabled) return;
+  const plan = comparisonPlan;
+  await doRun(plan[style].ranges, false, {
+    video:plan.video, source_title:document.getElementById('source_title').value.trim(),
+    selection:'manual', voice:'commentary', aspect:style === 'short' ? 'vertical' : 'landscape',
+    editorial_file:plan[style].editorial_file, comparison_style:style, visual_reviewed:true,
+    title:'', hook:false, no_snap_speech:true, remove_silence:false, use_prepared:false,
+    audio_mix:style === 'short' ? 'original' : 'narration-only', narration_volume:1,
+    dialogue_volume:style === 'short' ? 1 : 0, bg_mode:'none', edit_credits:false, want_thumbnail:true,
+  });
 });
 </script>
 </body>

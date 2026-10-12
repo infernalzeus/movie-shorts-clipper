@@ -1,11 +1,17 @@
 # movie-shorts-clipper
 
-Turn any movie or TV file into a upload-ready YouTube Short. Give it a file and one or more timestamp ranges — it cuts the clip, formats it for vertical, captions it, and generates a YouTube title/description/tags via a local Ollama model.
+Turn a movie or TV file into a captioned edit. Give it a file and timestamp ranges, or select scenes from subtitles. Clip selection, voice and frame shape are separate controls. Storytelling currently requires script selection; unsupported combinations fail before rendering instead of silently replacing manual ranges.
+
+### Approved commentary
+
+`--voice commentary --editorial-file path/to/editorial.json` uses reviewed copy instead of generating narration and metadata. The JSON contains non-empty `title` and `description`, a string list `tags`, and `commentary`: an ordered list of `{ "anchor": 7.0, "text": "Original analysis." }` entries timed in seconds on the final cut. TTS still requires internet access. Keep the file in the clip's existing output folder. `--no-edit-credits` preserves the supplied description. Default editing credits now name Movie Clipper; override only with accurate credits.
+
+Commentary can add original editorial value but does not guarantee copyright clearance, monetization eligibility or views. Landscape metadata is framed as long-form, and generated metadata now includes any original narration for context. Existing framing, fades, caption styles and hook behaviour are unchanged.
 
 Two output formats:
 
 - **Classic** — square center crop with word-pop karaoke captions (the original pipeline).
-- **Narrated** (`--narrate`) — the monetization-friendly format: the square crop sits on a black 9:16 canvas, an LLM writes a scene narration that an edge-tts voice reads at low volume (~5%), the narration text appears beneath the video in sync, dialogue captions come from the movie's own `.srt` file, and a thumbnail is extracted from the clip. The original narration layer makes the content transformative rather than a raw re-upload.
+- **Narrated** (`--narrate`) — the commentary format: the square crop sits on a black 9:16 canvas, commentary is read by edge-tts, its text appears beneath the video in sync, and dialogue captions can come from the movie's `.srt` file. Review the commentary for accuracy and original value before upload.
 
 ## What you need installed first
 
@@ -146,3 +152,30 @@ Drop `.mp3` / `.wav` / `.ogg` files into the `audio/` folder. One is picked at r
 - The vertical crop is a simple center crop — no face tracking. For off-center subjects, pre-crop the source or adjust `--crop-w`/`--crop-h`.
 - Wikipedia context lookup is best-effort — if the title isn't found, the LLM falls back to its own knowledge.
 - For the best transcription accuracy on heavy accents or non-English dialogue, use `--whisper-model large-v3`.
+
+### Commentary audio and review
+
+`--audio-mix original|narrator-led|narration-only` is independent of clip selection. Omission preserves existing defaults. Narrator-led ducks the film; narration-only mutes its entire soundtrack. A lead mix raises the legacy default narrator level to 1.0. Approved commentary fails if a spoken line cannot fit its assigned window instead of moving or dropping it. It may still be sped up within the existing tempo cap. Existing metadata records source ranges, actual narration timing, mix and three unreviewed statuses (rights, audiovisual, Studio). These are review records, not clearance or monetization certification.
+
+### Reviewed storytelling recaps
+
+Use `--selection script --voice storytelling --shape landscape --editorial-file path/to/editorial.json --no-edit-credits`. The same JSON metadata fields apply, but use `script` instead of `commentary`:
+
+```json
+{"title":"Reviewed recap", "description":"Original scene analysis", "tags":[], "script":[{"start":120.0,"end":140.0,"narration":"Your reviewed narration for this part of the sequence."}]}
+```
+
+Starts and ends are source seconds; starts must increase and narration must be non-empty. Speech determines each cut length (including existing inter-line/tail padding). Each cut must fit its reviewed source window, the movie duration, and optional `--span`; otherwise rendering stops with an error. This path bypasses script and metadata generation and preserves the reviewed wording. It still uses online TTS and requires the existing subtitle input. Target duration is approximate for generated scripts; an approved script's actual spoken length determines its duration. Existing generated storytelling and commentary behaviour remain available. A 16:9 recap is long-form; aspect ratio does not establish copyright clearance.
+
+Automatic storytelling now scales segment count and a total word budget to the target duration. Actual TTS duration is measured before cutting: vertical/square storytelling fails if it exceeds the requested target or 180 seconds; landscape warns above 115% of target. This avoids silent overshoot without truncating narration. Long-form duration remains approximate.
+
+### Paired editorial comparison (web interface)
+Enable a subtitle-backed source window, then use **Compare short and long edits**. Movie Clipper divides the source window into four ordered sections. The model chooses numbered subtitle lines, story explanations and brief bylines; the program calculates cut ranges from the selected lines, verifies dialogue coverage and shows candidate frames. Attribution warnings remain visible for manual review, with a feedback field for regeneration. Review the attribution and continuity before checking approval. Both versions share a runtime: the Short uses eight cuts and four brief text bylines without generated speech; landscape uses four longer cuts and spoken analysis with film audio muted. Hooks, silence removal, and boundary snapping are disabled for this fixed-duration comparison. Automated checks and frame review do not establish footage rights, monetization eligibility, or Content ID clearance.
+
+### Channel branding and upload records
+
+`assets/brand/brand.json` supplies channel name, handle, watermark, accent/secondary colours, optional avatar and the plain `subscribe_prompt`. Yash can change that wording in one line when a subscriber promise is decided. Put an image at `assets/brand/avatar.png` or set `avatar_path` (relative paths resolve from the project root). Missing/unreadable artwork falls back to a text-only card. `--watermark mv-edits` reads the configured text; `--watermark none` disables the footage watermark independently of the end card.
+
+All formats append a silent animated identity card by default. Use `--no-end-card` to omit it, `--end-card` to enable it, and `--end-card-duration 2` to set its length (1.5–2.5 seconds). The same controls are available in the web interface. This is separate from recap's existing movie montage (`--no-outro`). The card adds time after the edit and thumbnail frame: use `--no-end-card` when preserving an approved comparison's exact runtime. Storytelling Short duration guards include the card in the target budget. Branding is shared identity, not evidence that the substantive stories are identical or that content will qualify for monetization.
+
+The final `metadata.json.render` includes a unique `render_id`, absolute `output_path`, title, shape, voice, mix, measured `final_duration` in seconds, spoken `narration_coverage_pct`, `byline_only`, requested/actual `end_card` state and duration. Coverage unions spoken intervals and divides by the complete delivered runtime; text-only bylines count as zero speech. Existing timing records are retained. `youtube_video_id` starts as null: record the uploaded video's ID alongside this render record to join Studio exports at equal ages. Keep records before reusing an output folder. A card failure preserves the body, records that no card was added and reports an error rather than marking the draft ready. No Studio API or copyright-check integration is added.

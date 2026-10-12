@@ -1,6 +1,7 @@
 """Transcribe a clip with faster-whisper and return word-level timestamps."""
 
 from dataclasses import dataclass
+import os
 from pathlib import Path
 
 
@@ -14,15 +15,19 @@ class Word:
 def transcribe(
     video_path: Path,
     model_size: str = "small",
-    device: str = "auto",
-    compute_type: str = "auto",
+    device: str | None = None,
+    compute_type: str | None = None,
     language: str = "en",
     source_title: str = "",
 ) -> list[Word]:
     """Run faster-whisper on video_path and return a flat list of word-level timestamps."""
-    # Imported lazily so SRT-based runs never pay the faster-whisper/ctranslate2 load cost
+    # Imported lazily so SRT-based runs never pay the faster-whisper/ctranslate2 load cost.
+    # Agent Hub supplies CPU/int8 to keep optional transcription from competing
+    # with rendering and local models; direct CLI use keeps automatic selection.
     from faster_whisper import WhisperModel
 
+    device = device or os.getenv("CLIPPER_WHISPER_DEVICE", "auto")
+    compute_type = compute_type or os.getenv("CLIPPER_WHISPER_COMPUTE_TYPE", "auto")
     model = WhisperModel(model_size, device=device, compute_type=compute_type)
 
     # Seed Whisper with movie context so proper nouns and dialogue style bias its vocabulary.

@@ -17,7 +17,9 @@ from pathlib import Path
 import requests
 
 from clip_selector import parse_timestamp
-from metadata import DEFAULT_MODEL, FALLBACK_MODEL, OLLAMA_URL, fetch_movie_context
+# Re-exported so recap.py / narrative.py keep importing it from here.
+from jsonsalvage import loads_lenient as _loads_lenient
+from metadata import DEFAULT_MODEL, FALLBACK_MODEL, OLLAMA_URL, _fit_num_ctx, fetch_movie_context
 from subtitles import Cue, parse_srt
 
 if hasattr(sys.stdout, "reconfigure"):
@@ -41,12 +43,12 @@ Below is the movie's dialogue, condensed from the subtitles. Each line is:
 {condensed}
 ---
 
-Pick the {count} best self-contained moments for vertical short-form clips. Favor:
+Pick the {count} best self-contained moments for {form_hint}. Favor:
 - dramatic confrontations, iconic or quotable exchanges, big reveals, sharp humor
 - scenes that make sense without seeing the rest of the movie
 - dialogue-dense stretches (the clip gets subtitles burned in)
 
-Each scene must be 20 to 60 seconds long. Use the timestamps shown above.
+Each scene must be {min_seconds} to {max_seconds} seconds long. Use the timestamps shown above.
 Start and end on COMPLETE sentences — never begin or cut off in the middle of
 a line of dialogue. Prefer a natural entry point (a question, a provocation,
 a scene change) and a natural exit (a punchline, a verdict, a door slam).
@@ -70,6 +72,23 @@ def _fmt_ts(seconds: float) -> str:
     h, rem = divmod(seconds, 3600)
     m, s = divmod(rem, 60)
     return f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
+
+
+def _fmt_ts_precise(seconds: float) -> str:
+    """Like _fmt_ts but keeps CENTISECOND precision — for the '--ranges' cut
+    strings, never for the LLM prompt.
+
+    _fmt_ts rounds to a whole second, which is fine for the condensed dialogue we
+    show the model but WRONG for the actual cut: a beat whose real speech boundary
+    lands at 12.4s would cut at 12s (chopping the line) or 13s (bleeding the next
+    one in). The cut point computed by _snap_to_cues / speech-snap is sub-second,
+    so we emit it at hundredths and let parse_timestamp read the fraction back.
+    """
+    seconds = max(0.0, float(seconds))
+    h, rem = divmod(seconds, 3600.0)
+    m, s = divmod(rem, 60.0)
+    h, m = int(h), int(m)
+    return f"{h}:{m:02d}:{s:05.2f}" if h else f"{m}:{s:05.2f}"
 
 
 def _condense(cues: list[Cue]) -> str:
@@ -140,10 +159,9 @@ def _call_ollama(model: str, prompt: str) -> str:
             "prompt": prompt,
             "format": "json",
             "stream": False,
-            # A whole movie's condensed dialogue is ~20K tokens — without this,
-            # Ollama truncates at its small default context and the model
-            # answers from a mangled prompt.
-            "options": {"num_ctx": 32768},
+            # Ollama's own default is small (4096 on this machine), which
+            # truncates the prompt silently; a flat 32768 over-allocates. Fit it.
+            "options": {"num_ctx": _fit_num_ctx(prompt)},
         },
         timeout=600,
     )
@@ -156,16 +174,28 @@ def _call_ollama(model: str, prompt: str) -> str:
     return response.json()["response"]
 
 
+DEFAULT_MIN_SECONDS = 20.0
+DEFAULT_MAX_SECONDS = 60.0
+
+
 def suggest_scenes(
     srt_path: Path,
     source_title: str = "",
     model: str = DEFAULT_MODEL,
     count: int = 5,
+    min_seconds: float = DEFAULT_MIN_SECONDS,
+    max_seconds: float = DEFAULT_MAX_SECONDS,
 ) -> list[dict]:
     """Return up to `count` suggested scenes: [{start, end, range, title, reason}, ...].
 
     start/end are seconds; range is a ready-to-use '--ranges' string chunk.
+
+    min_seconds/max_seconds set the length the LLM aims for AND the window the
+    results are validated against. The caller picks them from the output shape:
+    a 9:16 Short wants 20-60s, a 16:9 long-form video wants minutes.
     """
+    min_seconds = max(2.0, float(min_seconds))
+    max_seconds = max(min_seconds + 1.0, float(max_seconds))
     cues = parse_srt(srt_path)
     if not cues:
         raise ValueError(f"No cues parsed from {srt_path}")
@@ -180,6 +210,10 @@ def suggest_scenes(
         movie_context=movie_context,
         condensed=_condense(cues),
         count=count,
+        min_seconds=f"{min_seconds:g}",
+        max_seconds=f"{max_seconds:g}",
+        form_hint=("long-form YouTube videos" if max_seconds > 180
+                   else "vertical short-form clips"),
     )
 
     try:
@@ -190,10 +224,9 @@ def suggest_scenes(
         print(f"! {model} unavailable ({type(exc).__name__}), falling back to {FALLBACK_MODEL}", file=sys.stderr)
         raw = _call_ollama(FALLBACK_MODEL, prompt)
 
-    try:
-        scenes_raw = json.loads(raw).get("scenes", [])
-    except json.JSONDecodeError as exc:
-        raise ValueError(f"Ollama did not return valid JSON: {raw!r}") from exc
+    scenes_raw = _loads_lenient(raw, "scenes")
+    if not scenes_raw:
+        raise ValueError(f"Ollama returned no usable scenes: {raw[:400]!r}")
 
     movie_end = cues[-1].end
     scenes: list[dict] = []
@@ -206,15 +239,16 @@ def suggest_scenes(
         # LLMs (especially small local ones) hallucinate timestamps — validate hard.
         if end <= start or start >= movie_end:
             continue
-        if end - start > 90:
-            end = start + 60
+        if end - start > max_seconds * 1.5:
+            end = start + max_seconds
         start, end = _snap_to_cues(cues, start, end)
-        if end <= start or end - start < 8 or end - start > 100:
+        span = end - start
+        if end <= start or span < min_seconds * 0.4 or span > max_seconds * 1.7:
             continue
         scenes.append({
             "start": round(start, 1),
             "end": round(end, 1),
-            "range": f"{_fmt_ts(start)}-{_fmt_ts(end)}",
+            "range": f"{_fmt_ts_precise(start)}-{_fmt_ts_precise(end)}",
             "title": str(item.get("title", "")).strip(),
             "reason": str(item.get("reason", "")).strip(),
         })
@@ -229,6 +263,10 @@ def main() -> None:
     parser.add_argument("--title", default="", help="Movie title (default: derived from filename)")
     parser.add_argument("--model", default=DEFAULT_MODEL, help=f"Ollama model (default: {DEFAULT_MODEL})")
     parser.add_argument("--count", type=int, default=5, help="Number of scenes to suggest (default: 5)")
+    parser.add_argument("--min-seconds", type=float, default=DEFAULT_MIN_SECONDS,
+                        help=f"Shortest scene to aim for (default: {DEFAULT_MIN_SECONDS:g})")
+    parser.add_argument("--max-seconds", type=float, default=DEFAULT_MAX_SECONDS,
+                        help=f"Longest scene to aim for (default: {DEFAULT_MAX_SECONDS:g})")
     parser.add_argument("--json", action="store_true", help="Print machine-readable JSON only")
     args = parser.parse_args()
 
@@ -237,7 +275,8 @@ def main() -> None:
         print(f"Error: SRT file not found: {srt_path}", file=sys.stderr)
         sys.exit(1)
 
-    scenes = suggest_scenes(srt_path, source_title=args.title, model=args.model, count=args.count)
+    scenes = suggest_scenes(srt_path, source_title=args.title, model=args.model, count=args.count,
+                            min_seconds=args.min_seconds, max_seconds=args.max_seconds)
 
     if args.json:
         print(json.dumps({"scenes": scenes}, ensure_ascii=False))

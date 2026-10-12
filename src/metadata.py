@@ -13,11 +13,12 @@ import sys
 
 import requests
 
+from jsonsalvage import loads_lenient, salvage_object, trim_to_sentence
+
 OLLAMA_URL = "http://localhost:11434/api/generate"
 
-# Default credit line for the YouTube edit-style description. The channel wants
-# these to read like a hand-made After Effects edit — the tool is NEVER named.
-DEFAULT_EDITING_PROGRAM = "Adobe After Effects 2024"
+# Accurate default credit; callers can override it when another editor was used.
+DEFAULT_EDITING_PROGRAM = "Movie Clipper"
 
 _FAIR_USE_DISCLAIMER = (
     "© Copyright\n\n"
@@ -57,6 +58,14 @@ The description must be genuinely informative (aim for 4-6 sentences):
   characters, and tone — drawn from the background above
 - Add 1-2 sentences about what happens in THIS specific moment and why it lands
 - Naturally mention "{source_title}" for search
+
+SPEAKER ATTRIBUTION: the transcript never says who is speaking, and the movie
+background lists characters who may not be in THIS moment at all. Name a
+character — in the title or the description — ONLY when the transcript itself
+makes it unmistakable (they are addressed by name, or the surrounding lines
+identify them). Otherwise use a role or stay neutral. A WRONG NAME IS FAR WORSE
+THAN NO NAME: naming the wrong character in a burned-in title is the most
+visible possible error, and it cannot be edited after upload.
 
 IMPORTANT: "{source_title}" is the movie/show name only. Do NOT put any
 release/format jargon in the title or description — no resolution (1080p, 4K,
@@ -134,13 +143,15 @@ def generate_titles(
         print(f"      ! {model} unavailable ({type(exc).__name__}), falling back to {FALLBACK_MODEL}")
         raw = _call_ollama(FALLBACK_MODEL, prompt)
 
-    try:
-        data = json.loads(raw)
-    except json.JSONDecodeError as exc:
-        raise ValueError(f"Ollama did not return valid JSON: {raw!r}") from exc
+    titles_raw = loads_lenient(raw, "titles")
+    if not titles_raw:
+        try:
+            titles_raw = (json.loads(raw) or {}).get("titles") or []
+        except json.JSONDecodeError:
+            titles_raw = []
 
     out: list[dict] = []
-    for item in data.get("titles") or []:
+    for item in titles_raw:
         # Tolerate a bare list of strings — smaller models drop the object shape.
         if isinstance(item, str):
             text, angle = item, ""
@@ -153,7 +164,7 @@ def generate_titles(
     return out[:count]
 
 
-def fetch_movie_context(source_title: str) -> str:
+def fetch_movie_context(source_title: str, detailed: bool = False) -> str:
     """Fetch a brief Wikipedia summary for the movie/show to ground the description.
 
     Best-effort and fail-fast: a short timeout means a blocked or slow route
@@ -163,6 +174,17 @@ def fetch_movie_context(source_title: str) -> str:
     if _SKIP_WEB_CONTEXT:
         return ""
     try:
+        if detailed:
+            resp = requests.get("https://en.wikipedia.org/w/api.php",
+                params={"action": "query", "format": "json", "prop": "extracts",
+                        "explaintext": 1, "redirects": 1, "titles": source_title},
+                timeout=4, headers={"User-Agent": "movie-shorts-clipper/1.0"})
+            resp.raise_for_status()
+            pages = resp.json().get("query", {}).get("pages", {})
+            extract = next((p.get("extract", "") for p in pages.values() if p.get("extract")), "")
+            if extract:
+                # Plot and cast normally precede production; retain roles, not just actor names.
+                return extract.split("== Production ==")[0][:14000]
         encoded = requests.utils.quote(source_title)
         resp = requests.get(
             f"https://en.wikipedia.org/api/rest_v1/page/summary/{encoded}",
@@ -178,10 +200,35 @@ def fetch_movie_context(source_title: str) -> str:
     return ""
 
 
-def _call_ollama(model: str, prompt: str) -> str:
+def _fit_num_ctx(prompt: str, reserve: int = 2048) -> int:
+    """Context window sized to THIS prompt, not a flat maximum.
+
+    Asking for a fixed 32768 makes Ollama allocate a 32k KV cache for every
+    request. On a 12 GB card alongside an 8B model that is wasteful at best and
+    pushes layers onto the CPU at worst, which reads as the job hanging. Ollama's
+    own default here is 4096, which silently truncates a long prompt instead.
+    Size to the prompt plus room for the answer, round to a power of two, clamp.
+    """
+    needed = len(prompt) // 4 + reserve          # ~4 chars per token
+    size = 1 << max(needed, 1).bit_length()      # next power of two
+    return max(4096, min(32768, size))
+
+
+def _call_ollama(model: str, prompt: str, *, bounded: bool = False) -> str:
+    extra = {"think": False} if bounded else {}
     response = requests.post(
         OLLAMA_URL,
-        json={"model": model, "prompt": prompt, "format": "json", "stream": False},
+        json={
+            "model": model,
+            "prompt": prompt,
+            "format": "json",
+            "stream": False,
+            # A long clip's transcript plus the movie context runs past Ollama's
+            # small default window; without this the model answers from a
+            # truncated prompt (every other agent here already sets it).
+            "options": {"num_ctx": _fit_num_ctx(prompt, reserve=4096), **({"num_predict": 4096, "temperature": 0.2} if bounded else {})},
+            **extra,
+        },
         timeout=180,
     )
     if response.status_code == 404:
@@ -193,7 +240,8 @@ def _call_ollama(model: str, prompt: str) -> str:
     return response.json()["response"]
 
 
-def generate_metadata(transcript: str, source_title: str = "", model: str = DEFAULT_MODEL) -> dict:
+def generate_metadata(transcript: str, source_title: str = "", model: str = DEFAULT_MODEL,
+                      content_format: str = "short", editorial_context: str = "") -> dict:
     title = source_title or "this movie/show"
     movie_context = fetch_movie_context(title) if source_title else ""
     if not movie_context:
@@ -204,6 +252,14 @@ def generate_metadata(transcript: str, source_title: str = "", model: str = DEFA
         source_title=title,
         movie_context=movie_context,
     )
+    if content_format == "long-form":
+        prompt = prompt.replace("YouTube Shorts", "YouTube long-form video").replace(
+            "YouTube Short", "YouTube long-form video")
+    prompt += ("\nAccuracy: do not guess whether the source is a film or a series. "
+               "Use only grounded facts; omit uncertain names and claims. "
+               "Describe this edit's actual focus before general movie background.\n")
+    if editorial_context:
+        prompt += "\nOriginal commentary in this edit:\n" + editorial_context[:12000]
 
     try:
         raw = _call_ollama(model, prompt)
@@ -213,14 +269,27 @@ def generate_metadata(transcript: str, source_title: str = "", model: str = DEFA
         print(f"      ! {model} unavailable ({type(exc).__name__}), falling back to {FALLBACK_MODEL}")
         raw = _call_ollama(FALLBACK_MODEL, prompt)
 
-    try:
-        data = json.loads(raw)
-    except json.JSONDecodeError as exc:
-        raise ValueError(f"Ollama did not return valid JSON: {raw!r}") from exc
+    # Metadata is cosmetic — a title, a description, some tags. It is generated
+    # AFTER the clip has been cut and captioned, so raising here throws away
+    # real work over a cut-off string. Salvage what arrived, then fall back.
+    data = salvage_object(raw)
+    if not data:
+        print(f"      ! metadata JSON unreadable ({len(raw)} chars) — using the source title")
+    elif not isinstance(data.get("description"), str):
+        data["description"] = ""
 
     data.setdefault("title", "")
     data.setdefault("description", "")
     data.setdefault("tags", [])
+    if not isinstance(data["tags"], list):
+        data["tags"] = []
+    # A recovered description usually stops mid-word; end it on a sentence.
+    trimmed = trim_to_sentence(str(data["description"]))
+    if trimmed != str(data["description"]).strip():
+        print("      ! description was cut short — trimmed to the last complete sentence")
+    data["description"] = trimmed
+    if not str(data["title"]).strip():
+        data["title"] = title if title != "this movie/show" else "Untitled clip"
 
     # Guarantee hashtags are appended to the description regardless of LLM compliance
     if data["tags"]:

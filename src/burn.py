@@ -6,6 +6,13 @@ from pathlib import Path
 
 _AUDIO_EXTS = {".mp3", ".wav", ".ogg", ".aac", ".flac", ".m4a"}
 
+# Bundled high-impact caption fonts (Anton, Bebas Neue — the faces viral shorts
+# use) live here; libass is pointed at this dir via the ass filter's `fontsdir`
+# so an .ass referencing "Anton"/"Bebas Neue" resolves even though they aren't
+# installed on the machine. Windows-shipped families (Impact, Arial Black, …)
+# still resolve from the system as before.
+FONTS_DIR = Path(__file__).resolve().parent.parent / "assets" / "fonts"
+
 # Recap mix: the movie DIALOGUE is the lead and the music is a bed that ducks
 # UNDER it (classic voice-over sidechain). Movie dialogue is quiet + dynamic
 # (~-26 dB) while music is loudness-maximised (~-6 dB), so the dialogue is first
@@ -15,10 +22,26 @@ _AUDIO_EXTS = {".mp3", ".wav", ".ogg", ".aac", ".flac", ".m4a"}
 # slamming peaks into the limiter (makeup 8 did that = the "tearing" distortion).
 _RECAP_DIALOGUE_NORM = "acompressor=threshold=-26dB:ratio=3:attack=10:release=250:makeup=5"
 
+# Loudness mastering. Every finished clip is normalised to the social-media
+# loudness standard so clips sound as loud/consistent as other creators' and
+# don't jump shot-to-shot. Technique borrowed from hotclip (xixihhhh) and
+# clippyme, which both master to -14 LUFS (EBU R128); TP=-1.5 leaves true-peak
+# headroom so the AAC re-encode never clips. Single-pass loudnorm (fast, no
+# measurement pre-pass) is enough for our purposes — the input is already
+# compressed/limited by the branch above it.
+_MASTER_LUFS_DEFAULT = -14.0
+
+
+def _master_suffix(loudness_target: float | None) -> str:
+    """The loudnorm filter to tack onto a branch's terminal audio node, or ''."""
+    if loudness_target is None:
+        return ""
+    return f",loudnorm=I={loudness_target}:TP=-1.5:LRA=11"
+
 # Available watermarks — add more entries here to extend the selectable list later.
-WATERMARKS: dict[str, str] = {
-    "mv-edits": "MV EDITS",
-}
+def get_watermarks() -> dict[str, str]:
+    from outro import load_brand
+    return {"mv-edits": load_brand()["watermark_text"]}
 
 
 def _escape_filter_path(path: Path) -> str:
@@ -63,6 +86,10 @@ def burn_subtitles(
     pre_filter: str | None = None,
     mirror: bool = False,
     music_duck: bool = False,
+    narration_lead: bool = False,
+    dialogue_volume: float = 0.22,
+    loudness_target: float | None = _MASTER_LUFS_DEFAULT,
+    output_duration: float | None = None,
 ) -> Path:
     """Burn the .ass captions into the video and mix the audio layers:
     movie audio (full, unchanged) + narration voiceover at narration_volume,
@@ -73,13 +100,17 @@ def burn_subtitles(
     one less lossy x264 generation."""
     output_path.parent.mkdir(parents=True, exist_ok=True)
     ass_arg = _escape_filter_path(ass_path)
+    # Point libass at the bundled-fonts dir so "Anton"/"Bebas Neue" resolve.
+    fonts_arg = _escape_filter_path(FONTS_DIR) if FONTS_DIR.is_dir() else ""
+    ass_filter = f"ass='{ass_arg}':fontsdir='{fonts_arg}'" if fonts_arg else f"ass='{ass_arg}'"
+    master = _master_suffix(loudness_target)   # -14 LUFS mastering (hotclip/clippyme)
 
     # hflip goes FIRST so only the footage is mirrored — the ass captions and the
     # watermark are added afterwards, so text stays the right way round.
     vf_parts = ["hflip"] if mirror else []
     if pre_filter:
         vf_parts.append(pre_filter)
-    vf_parts.append(f"ass='{ass_arg}'")
+    vf_parts.append(ass_filter)
     if watermark:
         vf_parts.append(_watermark_filter(watermark))
     vf = ",".join(vf_parts)
@@ -95,7 +126,51 @@ def burn_subtitles(
         print(f"      -> skipping first {bg_skip:g}s of background music")
 
     try:
-        if narration_audio:
+        if narration_audio and narration_lead:
+            # Narrator-led mix: the NARRATOR leads (storytelling or commentary). The movie's own audio is pulled
+            # down to `dialogue_volume` and ducks further whenever the narrator
+            # speaks (sidechain keyed off the voice). This is the inverse of the
+            # commentary branch below, where the film leads and the voice sits
+            # quietly under it — and it is what a long-form recap needs, because
+            # there the narration IS the content and the footage illustrates it.
+            dur = _get_duration(video_path)
+            norm = "aresample=48000,aformat=channel_layouts=stereo"
+            inputs = ["-i", str(video_path), "-i", str(narration_audio)]
+            chains = [
+                f"[0:a]{norm},volume={dialogue_volume},apad,atrim=0:{dur},asetpts=N/SR/TB[mv]"
+            ]
+            under = "[mv]"
+            if bg_music:
+                inputs += ["-i", str(bg_music)]
+                chains.append(
+                    f"[2:a]{bg_pre}aloop=loop=-1:size=2000000000,atrim=0:{dur},"
+                    f"volume={bg_volume},{norm}[bg]"
+                )
+                # Fold music into the same "under" bus, so ONE sidechain ducks
+                # everything beneath the voice. A second compressor keyed off the
+                # same source would need another asplit and buys nothing.
+                chains.append(f"[mv][bg]amix=inputs=2:duration=first:normalize=0[under]")
+                under = "[under]"
+            chains += [
+                f"[1:a]volume={narration_volume},{norm},apad,atrim=0:{dur},asetpts=N/SR/TB[nar]",
+                "[nar]asplit=2[narkey][narout]",
+                f"{under}[narkey]sidechaincompress="
+                "threshold=0.03:ratio=6:attack=20:release=400[underduck]",
+                "[narout][underduck]amix=inputs=2:duration=first:normalize=0,"
+                f"alimiter=limit=0.95{master}[aout]",
+            ]
+            _run_ffmpeg([
+                "ffmpeg", "-y",
+                *inputs,
+                "-filter_complex", ";".join(chains),
+                "-vf", vf,
+                "-map", "0:v", "-map", "[aout]",
+                "-c:v", "libx264", "-crf", "18", "-preset", "slow",
+                "-c:a", "aac", "-b:a", "192k",
+                *(["-t", str(output_duration)] if output_duration is not None else []),
+                str(output_path),
+            ])
+        elif narration_audio:
             dur = _get_duration(video_path)
             inputs = ["-i", str(video_path), "-i", str(narration_audio)]
             # Movie audio plays at full volume, untouched — the narration is just
@@ -127,7 +202,7 @@ def burn_subtitles(
             # duration=first → the movie ([0:a]) sets the length, so its tail is
             # never clipped; amix pads the finite narration with trailing silence.
             chains.append(
-                f"{mix_labels}amix=inputs={n_mix}:duration=first:normalize=0[aout]"
+                f"{mix_labels}amix=inputs={n_mix}:duration=first:normalize=0{master}[aout]"
             )
             _run_ffmpeg([
                 "ffmpeg", "-y",
@@ -137,6 +212,7 @@ def burn_subtitles(
                 "-map", "0:v", "-map", "[aout]",
                 "-c:v", "libx264", "-crf", "18", "-preset", "slow",
                 "-c:a", "aac", "-b:a", "192k",
+                *(["-t", str(output_duration)] if output_duration is not None else []),
                 str(output_path),
             ])
         elif bg_music and music_duck:
@@ -167,7 +243,7 @@ def burn_subtitles(
                 f"[1:a]{bg_pre}aloop=loop=-1:size=2000000000,atrim=0:{dur},"
                 f"volume={bg_volume},{norm}[bg];"
                 f"[bg][mvkey]sidechaincompress=threshold=0.05:ratio=2:attack=50:release=1200[bgduck];"
-                f"[mvout][bgduck]amix=inputs=2:duration=longest:normalize=0,alimiter=limit=0.95[aout]"
+                f"[mvout][bgduck]amix=inputs=2:duration=longest:normalize=0,alimiter=limit=0.95{master}[aout]"
             )
             _run_ffmpeg([
                 "ffmpeg", "-y",
@@ -178,6 +254,7 @@ def burn_subtitles(
                 "-map", "0:v", "-map", "[aout]",
                 "-c:v", "libx264", "-crf", "18", "-preset", "slow",
                 "-c:a", "aac", "-b:a", "192k",
+                *(["-t", str(output_duration)] if output_duration is not None else []),
                 str(output_path),
             ])
         elif bg_music:
@@ -193,7 +270,7 @@ def burn_subtitles(
                 f"[0:a]{norm}[a0];"
                 f"[1:a]{bg_pre}aloop=loop=-1:size=2000000000,atrim=0:{dur},"
                 f"volume={bg_volume},{norm}[bg];"
-                f"[a0][bg]amix=inputs=2:duration=first:normalize=0[aout]"
+                f"[a0][bg]amix=inputs=2:duration=first:normalize=0{master}[aout]"
             )
             _run_ffmpeg([
                 "ffmpeg", "-y",
@@ -204,15 +281,23 @@ def burn_subtitles(
                 "-map", "0:v", "-map", "[aout]",
                 "-c:v", "libx264", "-crf", "18", "-preset", "slow",
                 "-c:a", "aac", "-b:a", "192k",
+                *(["-t", str(output_duration)] if output_duration is not None else []),
                 str(output_path),
             ])
         else:
+            # No music/narration (e.g. Classic). Mastering means the audio must be
+            # re-encoded (loudnorm is a filter), so only touch it when a target is
+            # set; otherwise stream-copy the audio near-losslessly as before.
+            audio_args = (["-af", f"loudnorm=I={loudness_target}:TP=-1.5:LRA=11",
+                           "-c:a", "aac", "-b:a", "192k"]
+                          if loudness_target is not None else ["-c:a", "copy"])
             _run_ffmpeg([
                 "ffmpeg", "-y",
                 "-i", str(video_path),
                 "-vf", vf,
                 "-c:v", "libx264", "-crf", "18", "-preset", "slow",
-                "-c:a", "copy",
+                *audio_args,
+                *(["-t", str(output_duration)] if output_duration is not None else []),
                 str(output_path),
             ])
     except subprocess.CalledProcessError as e:

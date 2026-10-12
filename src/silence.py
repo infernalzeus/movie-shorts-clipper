@@ -80,6 +80,40 @@ def keep_intervals(
     return [(s, e) for s, e in keeps if e - s >= min_keep]
 
 
+def snap_ranges_to_speech(
+    video_path: Path,
+    ranges: list[tuple[float, float]],
+    window: float = 2.5,
+    pad: float = 0.12,
+    noise_db: float = -33.0,
+    min_gap: float = 0.14,
+) -> list[tuple[float, float]]:
+    """Snap each clip's start/end to a real speech GAP so cuts never land
+    mid-word — the fix for lines chopped or bleeding in because the SUBTITLE
+    timestamps don't match the actual spoken audio.
+
+    Detects the audio's silences once, then for each range moves the start to the
+    nearest speech ONSET (a silence end) and the end to the nearest speech OFFSET
+    (a silence start) within `window` seconds. Verifying against the audio itself
+    sidesteps subtitle-vs-audio drift (and Whisper's wording inaccuracy — we only
+    use gap timing, never the words).
+    """
+    sils = detect_silences(video_path, noise_db=noise_db, min_silence=min_gap)
+    if not sils:
+        return ranges
+    onsets = [e for _, e in sils if e != float("inf")]   # silence END  = speech starts
+    offsets = [s for s, _ in sils]                        # silence START = speech ends
+    out: list[tuple[float, float]] = []
+    for s, e in ranges:
+        on = [o for o in onsets if abs(o - s) <= window]
+        off = [o for o in offsets if abs(o - e) <= window]
+        ns = (min(on, key=lambda x: abs(x - s)) - pad) if on else s
+        ne = (min(off, key=lambda x: abs(x - e)) + pad) if off else e
+        ns = max(0.0, ns)
+        out.append((round(ns, 2), round(ne, 2)) if ne - ns >= 0.5 else (s, e))
+    return out
+
+
 def remap_time(t: float, keeps: list[tuple[float, float]]) -> float:
     """Map a time on the original clip timeline onto the trimmed timeline.
 
