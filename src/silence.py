@@ -18,6 +18,8 @@ def detect_silences(
     video_path: Path,
     noise_db: float = -35.0,
     min_silence: float = 1.0,
+    start: float | None = None,
+    duration: float | None = None,
 ) -> list[tuple[float, float]]:
     """Run ffmpeg silencedetect over the clip's audio.
 
@@ -26,25 +28,33 @@ def detect_silences(
     not blank space. A trailing silence that runs to EOF is returned with
     end=inf (the caller clamps to the clip duration).
     """
+    # `start`/`duration` restrict the decode to a slice. Snapping only needs a
+    # few seconds around each cut, and decoding a whole feature's audio to find
+    # them was the bulk of a Short's render time. -ss before -i seeks rather
+    # than decoding up to the point; reported times are relative to the slice,
+    # so the offset is added back below.
+    seek = ["-ss", f"{start:.3f}"] if start else []
+    span = ["-t", f"{duration:.3f}"] if duration else []
     proc = subprocess.run(
         [
-            "ffmpeg", "-hide_banner",
-            "-i", str(video_path),
+            "ffmpeg", "-hide_banner", *seek,
+            "-i", str(video_path), *span,
             "-af", f"silencedetect=noise={noise_db}dB:d={min_silence}",
             "-f", "null", "-",
         ],
         capture_output=True, text=True, errors="replace",
     )
+    offset = start or 0.0
     silences: list[tuple[float, float]] = []
     cur_start: float | None = None
     for line in proc.stderr.splitlines():
         m = _SILENCE_START_RE.search(line)
         if m:
-            cur_start = max(0.0, float(m.group(1)))
+            cur_start = max(0.0, float(m.group(1))) + offset
             continue
         m = _SILENCE_END_RE.search(line)
         if m and cur_start is not None:
-            silences.append((cur_start, float(m.group(1))))
+            silences.append((cur_start, float(m.group(1)) + offset))
             cur_start = None
     if cur_start is not None:
         silences.append((cur_start, float("inf")))
@@ -98,7 +108,25 @@ def snap_ranges_to_speech(
     sidesteps subtitle-vs-audio drift (and Whisper's wording inaccuracy — we only
     use gap timing, never the words).
     """
-    sils = detect_silences(video_path, noise_db=noise_db, min_silence=min_gap)
+    # Analyse ONLY the seconds around each boundary. Scanning the whole film to
+    # find gaps near a 30-second excerpt was the dominant cost of a Short.
+    margin = window + 1.0
+    probes: list[tuple[float, float]] = []
+    for s_, e_ in ranges:
+        probes.append((max(0.0, s_ - margin), 2 * margin))
+        probes.append((max(0.0, e_ - margin), 2 * margin))
+    probes.sort()
+    merged: list[list[float]] = []
+    for start_, dur_ in probes:                 # coalesce overlapping probes
+        if merged and start_ <= merged[-1][0] + merged[-1][1]:
+            merged[-1][1] = max(merged[-1][1], start_ + dur_ - merged[-1][0])
+        else:
+            merged.append([start_, dur_])
+    sils: list[tuple[float, float]] = []
+    for start_, dur_ in merged:
+        sils += detect_silences(video_path, noise_db=noise_db, min_silence=min_gap,
+                                start=start_, duration=dur_)
+    sils.sort()
     if not sils:
         return ranges
     onsets = [e for _, e in sils if e != float("inf")]   # silence END  = speech starts

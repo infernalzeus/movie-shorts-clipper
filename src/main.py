@@ -58,6 +58,7 @@ from metadata import (
     build_edit_description,
     clean_music_name,
     generate_metadata,
+    set_film_year,
 )
 from narration import NarrationBeat, generate_narration_beats
 from narrative import suggest_narrative
@@ -466,6 +467,9 @@ def main() -> None:
     # Release year (from the filename) → shown after the movie name on the thumbnail.
     year_match = _YEAR_RE.search(video_path.stem)
     movie_label = f"{source_title} ({year_match.group(0)})" if year_match else source_title
+    # Let the Wikipedia lookup ask for THIS film: a bare title resolves to the
+    # source novel/comic, and a generic one ("Oblivion") to a disambiguation page.
+    set_film_year(year_match.group(0) if year_match else None)
 
     # Subtitle file: explicit flag, else auto-detect next to the movie (--no-srt disables)
     srt_path: Path | None = None
@@ -924,9 +928,18 @@ def main() -> None:
         video_top = (frame_h - frame_w) // 2
         layout = {"width": frame_w, "height": frame_h,
                   "video_top": video_top, "video_bottom": video_top + frame_w}
-        pre_filter = (f"crop=min(iw\\,ih):min(iw\\,ih),"
-                      f"scale={frame_w}:{frame_w}:flags=lanczos,"
-                      f"pad={frame_w}:{frame_h}:0:{video_top}:black")
+        # Fill the bands above and below with a blurred, zoomed copy of the frame
+        # instead of flat black. A square-on-black 9:16 wastes 44% of the screen
+        # on nothing, which is what makes these read as cropped uploads rather
+        # than made-for-vertical. The graph is semicolon-separated but ends on an
+        # unlabelled filter, so the caption and watermark chain still appends.
+        pre_filter = (
+            f"split[bgsrc][fgsrc];"
+            f"[bgsrc]scale={frame_w}:{frame_h}:force_original_aspect_ratio=increase:flags=lanczos,"
+            f"crop={frame_w}:{frame_h},boxblur=28:2,eq=brightness=-0.09[bgblur];"
+            f"[fgsrc]crop=min(iw\\,ih):min(iw\\,ih),"
+            f"scale={frame_w}:{frame_w}:flags=lanczos[fgsq];"
+            f"[bgblur][fgsq]overlay=0:{video_top}")
         frame_size = (frame_w, frame_h)
     elif layout_mode == "landscape":
         # 16:9 1080p, no crop — keep the original framing, letterbox if the source

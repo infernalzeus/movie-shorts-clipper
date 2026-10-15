@@ -341,7 +341,12 @@ def build_ass(
     # gave a 1920-wide landscape frame a 106px caption — sized for a 1080-wide
     # vertical one.
     short_side = min(video_width, video_height)
-    caption_fontsize  = caption_fontsize  or max(44, short_side // 18)
+    # A 9:16 frame is viewed on a phone held at arm's length, and its captions sit
+    # in a band rather than over the picture — both want bigger type than the
+    # short-side rule gives. Keying everything to the short side made a vertical
+    # Short's captions the same 60px as a landscape video seen on a desktop.
+    _caption_div = 13 if video_height > video_width * 1.3 else 18
+    caption_fontsize  = caption_fontsize  or max(44, short_side // _caption_div)
     title_fontsize    = title_fontsize    or max(40, short_side // 22)
 
     if is_landscape:

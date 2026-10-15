@@ -164,8 +164,43 @@ def generate_titles(
     return out[:count]
 
 
+_FILMISH = re.compile(r"(film|movie|miniseries|television series|TV series)", re.IGNORECASE)
+
+
+_FILM_YEAR: str | None = None
+
+
+def set_film_year(year) -> None:
+    """Tell the lookup which year's film this render is about.
+
+    One process renders one film, so a module-level hint is enough. Generic
+    titles ("Oblivion", "Shooter") hit a disambiguation page even with "(film)";
+    the year resolves them. Set from the filename in main.py.
+    """
+    global _FILM_YEAR
+    _FILM_YEAR = str(year) if year else None
+
+
+def _film_candidates(source_title: str) -> list[str]:
+    """Title variants to try, most specific first.
+
+    A bare film title usually resolves to the SOURCE NOVEL or comic, not the
+    film: "I, Robot" returns Asimov's 1950 short-story collection and "The
+    Adventures of Tintin" returns Hergé's comic series. The agents then write
+    from publishing history with no cast, which is how a Haddock scene came out
+    captioned as Sakharine. Ask for the film explicitly.
+    """
+    if source_title.rstrip().endswith("film)"):      # caller already disambiguated
+        return [source_title]
+    out = []
+    if _FILM_YEAR:
+        out.append(f"{source_title} ({_FILM_YEAR} film)")
+    out += [f"{source_title} (film)", source_title]
+    return out
+
+
 def fetch_movie_context(source_title: str, detailed: bool = False) -> str:
-    """Fetch a brief Wikipedia summary for the movie/show to ground the description.
+    """Fetch a Wikipedia summary for the FILM to ground the agents' writing.
 
     Best-effort and fail-fast: a short timeout means a blocked or slow route
     (e.g. traffic funnelled through a VPN/exit node) degrades gracefully to no
@@ -173,6 +208,18 @@ def fetch_movie_context(source_title: str, detailed: bool = False) -> str:
     """
     if _SKIP_WEB_CONTEXT:
         return ""
+    fallback = ""
+    for candidate in _film_candidates(source_title):
+        got = _fetch_one(candidate, detailed)
+        if not got or " may refer to" in got[:200]:
+            continue
+        if _FILMISH.search(got[:400]):
+            return got
+        fallback = fallback or got
+    return fallback
+
+
+def _fetch_one(source_title: str, detailed: bool = False) -> str:
     try:
         if detailed:
             resp = requests.get("https://en.wikipedia.org/w/api.php",
@@ -261,13 +308,24 @@ def generate_metadata(transcript: str, source_title: str = "", model: str = DEFA
     if editorial_context:
         prompt += "\nOriginal commentary in this edit:\n" + editorial_context[:12000]
 
+    # The same reasoning that stops a truncated title killing a render applies to
+    # an unreachable model: this step runs AFTER the cut and the captions, and it
+    # only produces a title, a description and some tags. If Ollama is simply not
+    # running — which is normal on a machine someone games on — fall back to a
+    # locally-derived title and finish the video.
+    raw = ""
     try:
         raw = _call_ollama(model, prompt)
     except (requests.HTTPError, requests.ConnectionError, requests.Timeout) as exc:
-        if model == FALLBACK_MODEL:
-            raise
-        print(f"      ! {model} unavailable ({type(exc).__name__}), falling back to {FALLBACK_MODEL}")
-        raw = _call_ollama(FALLBACK_MODEL, prompt)
+        if model != FALLBACK_MODEL:
+            print(f"      ! {model} unavailable ({type(exc).__name__}), falling back to {FALLBACK_MODEL}")
+            try:
+                raw = _call_ollama(FALLBACK_MODEL, prompt)
+            except (requests.HTTPError, requests.ConnectionError, requests.Timeout) as exc2:
+                exc = exc2
+        if not raw:
+            print(f"      ! no model reachable ({type(exc).__name__}) — using the source title "
+                  f"and no description. The video itself is unaffected.")
 
     # Metadata is cosmetic — a title, a description, some tags. It is generated
     # AFTER the clip has been cut and captioned, so raising here throws away
